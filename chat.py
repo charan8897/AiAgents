@@ -6,7 +6,7 @@ Workflow:
     -> streams its intent analysis in real time
     -> responder (gemma-4-26b-a4b-it) streams the final answer
 
-Tool mode (--tool):
+Tool mode (auto-detected, or forced with --tool / '!' prefix):
     user query -> tools/cli.py -> normalized request JSON
     -> evaluator (31B) <-> responder (26B) <-> executor loop:
       - Evaluator (31B): plans, instructs 26B, quality-gates feedback
@@ -14,22 +14,31 @@ Tool mode (--tool):
       - Executor (subprocess): runs those commands
       - stdout/stderr (error or success) is sent back to 31B as feedback
 
+Routing:
+    Every query (interactive or one-shot) is classified automatically:
+    normal questions go to the chat workflow; queries that need shell
+    execution (files, code search, git, system info, ...) go to the tool
+    workflow. No --tool flag is required. In the interactive session,
+    prefix a message with '!' to force tool mode or '?' to force chat.
+
 History context:
     Conversation turns are kept as structured session data and sent to the API
     as native multi-turn contents (role 'user'/'model'), with the static agent
     instructions carried in systemInstruction — history is never flattened
     into prompt text. An interactive session keeps the session in memory;
-    --history FILE persists turns as JSON across runs.
+    --history FILE persists turns as JSON across runs. Tool-mode answers are
+    recorded in the same history, so follow-up queries (in either mode) can
+    reference earlier results.
 
 This uses a Gemini Console / Google AI Studio API key.
 
 Usage:
-    python chat.py                              # interactive session
+    python chat.py                              # interactive session (auto-routing)
     python chat.py "Hello"                      # one-shot message
     python chat.py --history chat.json "Hi"     # one-shot with saved history
     python chat.py --history chat.json          # interactive, auto-saved
     python chat.py --history chat.json --reset  # ignore existing history
-    python chat.py --tool "Find all TODOs"      # tool mode (evaluator<->executor loop)
+    python chat.py --tool "Find all TODOs"      # force tool mode (optional)
 """
 
 from __future__ import annotations
@@ -449,7 +458,7 @@ def evaluate_intent(
 
     style_enabled = start_evaluator_style()
     try:
-        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}, {label}) ---\n")
+        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}) ---\n")
         evaluator_response = stream_generate_content(
             EVALUATOR_MODEL,
             evaluator_session,
@@ -527,10 +536,47 @@ def ask(message: str, session: Session | None = None) -> str:
     return respond(message, intent_template, evaluator_response, session)
 
 
+def handle_message(
+    message: str,
+    session: Session,
+    history_path: Path | None = None,
+    *,
+    force_tool: bool = False,
+) -> str:
+    """Route one user message (chat vs. tool), update history, return the answer.
+
+    The route is decided automatically from the query intent (or forced with
+    ``force_tool``). Both chat and tool answers are recorded in the session so
+    follow-up queries keep full conversation context.
+    """
+    route = "tool" if force_tool else classify_route(message, session)
+
+    if route == "tool":
+        request = build_tool_request(message)
+        answer = run_tool_workflow(request, history=session.turns)
+    else:
+        answer = ask(message, session)
+
+    session.add("user", message)
+    session.add("assistant", answer)
+    if history_path is not None:
+        save_history(history_path, session.turns)
+    return answer
+
+
 def run_repl(session: Session, history_path: Path | None = None) -> int:
-    """Interactive multi-turn session with in-memory (and optional on-disk) history."""
+    """Interactive multi-turn session with in-memory (and optional on-disk) history.
+
+    Each query is routed automatically: normal questions go to the chat
+    workflow, while queries that require running shell commands (inspecting
+    files, searching code, system info, ...) go to the tool workflow — no
+    --tool flag needed. Prefix a message with '!' to force tool mode, or
+    '?' to force plain chat. History context flows into both modes.
+    """
     print(
-        "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
+        "Interactive mode. Type your message, or 'exit'/'quit' to leave.\n"
+        "Queries are routed automatically (chat vs. tool execution).\n"
+        "Prefix with '!' to force tool mode, '?' to force chat mode.",
         file=sys.stderr,
     )
     while True:
@@ -545,37 +591,35 @@ def run_repl(session: Session, history_path: Path | None = None) -> int:
         if user_input.lower() in {"exit", "quit"}:
             break
 
+        force_tool = False
+        force_chat = False
+        if user_input.startswith("!"):
+            force_tool = True
+            user_input = user_input[1:].strip()
+        elif user_input.startswith("?"):
+            force_chat = True
+            user_input = user_input[1:].strip()
+        if not user_input:
+            continue
+
         try:
-            answer = ask(user_input, session)
+            if force_chat:
+                answer = ask(user_input, session)
+                session.add("user", user_input)
+                session.add("assistant", answer)
+                if history_path is not None:
+                    save_history(history_path, session.turns)
+            else:
+                answer = handle_message(
+                    user_input, session, history_path, force_tool=force_tool
+                )
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             continue
 
-        session.add("user", user_input)
-        session.add("assistant", answer)
-        if history_path is not None:
-            save_history(history_path, session.turns)
-
         print(f"\nAssistant: {answer}\n")
     return 0
 
-def run_repl(session: Session, history_path: Path | None = None) -> int:
-    """Interactive multi-turn session with in-memory (and optional on-disk) history."""
-    print(
-        "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
-        file=sys.stderr,
-    )
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(file=sys.stderr)
-            break
-
-        if not user_input:
-            continue
-        if user_input.lower() in {"exit", "quit"}:
-            break
 
 # ============================================================================
 # Tool mode — evaluator <-> executor feedback loop
@@ -597,6 +641,75 @@ def _invoke_cli(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
+
+
+# Heuristic fallback keywords used only when the routing model call fails.
+_TOOL_HINT_KEYWORDS = (
+    "file", "files", "folder", "directory", "run ", "execute", "command",
+    "grep", "find ", "search the", "list ", "count ", "todo", "install",
+    "disk", "process", "git ", "repo", "codebase", "lines of code",
+)
+
+
+def classify_route(message: str, session: Session | None = None) -> str:
+    """Decide whether a query needs the tool workflow or plain chat.
+
+    Asks the evaluator model (with conversation history for context, so
+    follow-ups like "now do the same for .py files" route correctly) for a
+    single-token decision. Falls back to a keyword heuristic if the API call
+    fails, so routing never blocks the session.
+    """
+    router_session = Session(
+        system_instruction=(
+            "You are a router in a chat client. Decide if the user's latest "
+            "message requires executing shell commands on the local machine "
+            "(inspecting files/folders, searching code, counting lines, git, "
+            "system info, running programs) or if it is a normal conversational "
+            "question answerable from knowledge alone.\n\n"
+            "Use the conversation history: a follow-up like 'now only the .py "
+            "files' after a file-search task is also TOOL.\n\n"
+            "Respond with exactly one word: TOOL or CHAT. No other text."
+        )
+    )
+    if session is not None:
+        router_session.turns = list(session.turns)
+    router_session.add("user", message)
+
+    try:
+        decision = generate_content(EVALUATOR_MODEL, router_session)
+    except RuntimeError:
+        lowered = message.lower()
+        return "tool" if any(k in lowered for k in _TOOL_HINT_KEYWORDS) else "chat"
+
+    return "tool" if "TOOL" in decision.upper() else "chat"
+
+
+def build_tool_request(message: str) -> dict:
+    """Run tools/cli.py --dry-run and return the normalized request JSON.
+
+    Raises RuntimeError on any failure so callers (REPL/one-shot) can report
+    the error without exiting the session.
+    """
+    if not TOOLS_CLI_PATH.exists():
+        raise RuntimeError(f"cli.py not found at {TOOLS_CLI_PATH}")
+
+    try:
+        result = _invoke_cli(message, "--dry-run")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("cli.py subprocess timed out.") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Error invoking cli.py: {exc}") from exc
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Error from cli.py:\n{result.stderr}")
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Error parsing cli.py output: {exc}\n{result.stdout}"
+        ) from exc
+
 
 
 def _tool_style_header(text: str) -> None:
@@ -679,11 +792,13 @@ def _stream_model(model: str, session: Session, heading: str) -> str:
         stop_evaluator_style(style_enabled)
 
 
-def run_tool_workflow(request: dict) -> str:
+def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> str:
     """Evaluator (31B) instructs responder (26B); execution feeds back to 31B.
 
     Each turn records command(s) actually run plus 31B/26B analysis. A command
     whose normalized key is already in history is never executed again.
+    ``history`` carries prior conversation turns so the objective can reference
+    earlier queries/answers (e.g. "now do the same for .py files").
     """
     objective = request["objective"]
     cwd = request.get("cwd", os.getcwd())
@@ -717,11 +832,27 @@ def run_tool_workflow(request: dict) -> str:
         return min(base + (step * 10), 300)
 
     os_name = "Windows (cmd/PowerShell)" if os.name == "nt" else "Unix"
+
+    # Render recent conversation turns (if any) so the evaluator can resolve
+    # references to earlier queries/answers in the objective.
+    conversation_context = ""
+    if history:
+        recent = history[-12:]
+        rendered = "\n".join(
+            f"{turn.role}: {turn.content[:1500]}" for turn in recent
+        )
+        conversation_context = (
+            "\nConversation history (for context — the objective may refer "
+            "to it):\n"
+            f"{rendered}\n"
+        )
+
     evaluator_system = (
         "You are the 31B evaluator in a two-model tool loop.\n"
         f"The 26B responder ({RESPONDER_MODEL}) writes shell commands. "
         "You never execute commands yourself.\n\n"
-        f"Normalized request:\n{json.dumps(request, indent=2)}\n\n"
+        f"Normalized request:\n{json.dumps(request, indent=2)}\n"
+        f"{conversation_context}\n"
         f"Host OS: {os_name}. Instruct 26B to use commands that work on this OS.\n\n"
         "YOUR ROLE:\n"
         "1. Analyse the objective and write clear instructions for the 26B responder.\n"
@@ -1005,70 +1136,33 @@ def main() -> int:
     parser.add_argument(
         "--tool",
         action="store_true",
-        help="Run in tool mode: evaluator->executor feedback loop",
+        help="force tool mode (auto-detected otherwise): evaluator->executor feedback loop",
     )
     args = parser.parse_args()
 
-    # --- Tool mode ---
-    if args.tool:
-        message = " ".join(args.message).strip()
-        if not message:
-            print("Error: --tool requires an objective message.", file=sys.stderr)
-            return 1
-
-        # Invoke cli.py via subprocess to get normalized request JSON
-        if not TOOLS_CLI_PATH.exists():
-            print(f"Error: cli.py not found at {TOOLS_CLI_PATH}", file=sys.stderr)
-            return 1
-
-        try:
-            result = _invoke_cli(message, "--dry-run")
-        except subprocess.TimeoutExpired:
-            print("Error: cli.py subprocess timed out.", file=sys.stderr)
-            return 1
-        except Exception as exc:
-            print(f"Error invoking cli.py: {exc}", file=sys.stderr)
-            return 1
-
-        if result.returncode != 0:
-            print(f"Error from cli.py:\n{result.stderr}", file=sys.stderr)
-            return 1
-
-        try:
-            request = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            print(f"Error parsing cli.py output: {exc}\n{result.stdout}", file=sys.stderr)
-            return 1
-
-        # Run the feedback loop
-        try:
-            answer = run_tool_workflow(request)
-        except RuntimeError as exc:
-            print(f"Error in tool workflow: {exc}", file=sys.stderr)
-            return 1
-
-        print(f"\n{answer}")
-        return 0
-
-    # --- Chat mode (existing) ---
+    # --- Session / history (shared by chat and tool modes) ---
     session = Session()
     if args.history is not None and not args.reset:
         session.turns = load_history(args.history)
 
     message = " ".join(args.message).strip()
+
+    if args.tool and not message:
+        print("Error: --tool requires an objective message.", file=sys.stderr)
+        return 1
+
+    # --- Interactive session (auto-routes chat vs. tool, keeps history) ---
     if not message:
         return run_repl(session, args.history)
 
+    # --- One-shot message (auto-routes too; --tool forces tool mode) ---
     try:
-        answer = ask(message, session)
+        answer = handle_message(
+            message, session, args.history, force_tool=args.tool
+        )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-
-    session.add("user", message)
-    session.add("assistant", answer)
-    if args.history is not None:
-        save_history(args.history, session.turns)
 
     print(answer)
     return 0
