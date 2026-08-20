@@ -447,21 +447,6 @@ def evaluate_intent(
 
     return evaluator_response
 
-    style_enabled = start_evaluator_style()
-    try:
-        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}) ---\n")
-        evaluator_response = stream_generate_content(
-            EVALUATOR_MODEL,
-            evaluator_input,
-            on_text=stream_to_stderr,
-        )
-        print_evaluator("\n--- Evaluator complete; generating final answer ---\n\n")
-    finally:
-        stop_evaluator_style(style_enabled)
-
-    return evaluator_response
-
-
 
 def clean_final_answer(text: str) -> str:
     """Extract the end-user answer from responder output if it leaks analysis."""
