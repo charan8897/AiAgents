@@ -2,9 +2,11 @@
 """Multi-agent Gemma chat client through the Gemini API.
 
 Workflow:
-    user query -> evaluator (gemma-4-31b-it) reads intent_prompt.yaml
-    -> streams its intent analysis in real time
+    user query -> evaluator gate pass (gemma-4-31b-it) sees ONLY the query
+    -> evaluator decides NEEDS_HISTORY true/false (no history wasted)
+    -> if true, evaluator re-runs WITH prior turns; otherwise that pass is skipped
     -> responder (gemma-4-26b-a4b-it) streams the final answer
+    -> responder receives prior turns only when the gate asked for them
 
 History context:
     Conversation turns are kept as structured session data and sent to the API
@@ -12,6 +14,12 @@ History context:
     instructions carried in systemInstruction — history is never flattened
     into prompt text. An interactive session keeps the session in memory;
     --history FILE persists turns as JSON across runs.
+
+    History is fetched lazily: the evaluator's first pass gets zero history,
+    and the conversation is only attached when the query actually refers back
+    to earlier turns ("my first question", "tell me more", ambiguous follow-ups).
+    Standalone queries (greetings, new topics, self-contained facts) never pay
+    for history tokens.
 
 This uses a Gemini Console / Google AI Studio API key.
 
@@ -28,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -406,36 +415,86 @@ def stream_to_stderr(text: str) -> None:
     print_evaluator(text)
 
 
-def evaluate_intent(
+def evaluator_system_instruction(
+    intent_template: IntentPromptTemplate,
+    *,
+    with_history: bool,
+) -> str:
+    """Build the 31B evaluator's systemInstruction for one pass.
+
+    The gate pass (``with_history=False``) must decide whether the query needs
+    history WITHOUT seeing it; the history pass re-analyzes the query with the
+    prior turns attached. Both passes share the YAML template instructions.
+    """
+    common = (
+        "You are the evaluator agent in a two-agent workflow.\n\n"
+        "Read this exact YAML prompt template loaded from intent_prompt.yaml:\n"
+        f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
+        f"Parsed prompt instruction from YAML key `prompt`:\n{intent_template.prompt}\n\n"
+    )
+    if not with_history:
+        return (
+            common
+            + "The current user query is the only user turn in this request: "
+            "conversation history is deliberately NOT attached to save tokens. "
+            "First decide whether answering the query requires earlier turns.\n"
+            "- Say NEEDS_HISTORY: true when the query refers back to earlier turns "
+            "(e.g. \"my first question\", \"tell me more about it\", pronouns with no "
+            "clear referent, or ambiguous names that depend on prior context).\n"
+            "- Say NEEDS_HISTORY: false for standalone queries: greetings, new topics, "
+            "self-contained factual questions.\n"
+            "- When unsure, prefer true so the responder keeps the needed context.\n\n"
+            "Write your analysis exactly once (do not draft it and then repeat it), "
+            "in this format:\n\n"
+            "NEEDS_HISTORY: true or false\n"
+            "REASON: one short line\n"
+            "ROUTING_CONTEXT: concise routing context for the final responder\n"
+        )
+    return (
+        common
+        + "The current query was flagged as depending on conversation history, and "
+        "the prior turns are attached to this request. Use them to resolve referents "
+        "and write your analysis exactly once (do not draft it and then repeat it), "
+        "in this format:\n\n"
+        "ROUTING_CONTEXT: concise routing context for the final responder, including "
+        "any facts pulled from history that the responder needs to answer\n"
+    )
+
+
+def parse_needs_history(text: str) -> bool | None:
+    """Parse the NEEDS_HISTORY flag from gate output (None when absent)."""
+    match = re.search(
+        r"NEEDS_HISTORY\s*\**\s*[:=]\s*\**\s*\**\s*(true|false|yes|no)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return match.group(1).lower() in {"true", "yes"}
+
+
+def run_evaluator_pass(
     user_query: str,
     intent_template: IntentPromptTemplate,
-    session: Session | None = None,
+    prior_turns: list[ChatTurn],
+    *,
+    label: str,
 ) -> str:
-    """Stream 31B evaluator intent analysis using the YAML prompt.
+    """Stream one 31B evaluator pass to stderr and return its full analysis.
 
-    The evaluator's static instructions go in systemInstruction; the
-    conversation history (if any) is sent as native prior turns, with the
-    current query as the final user turn. P3 will narrow this to a digest.
+    ``label`` distinguishes the gate pass (no history) from the history pass.
     """
     evaluator_session = Session(
-        system_instruction=(
-            "You are the evaluator agent in a two-agent workflow.\n\n"
-            "Read this exact YAML prompt template loaded from intent_prompt.yaml:\n"
-            f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
-            f"Parsed prompt instruction from YAML key `prompt`:\n{intent_template.prompt}\n\n"
-            "Analyze the user's query intent according to the YAML prompt template. "
-            "The YAML file content was provided above; do not say it is missing or implied. "
-            "Use the conversation history for context when the query refers to earlier turns. "
-            "Return your full analysis for the responder agent."
-        )
+        system_instruction=evaluator_system_instruction(
+            intent_template, with_history=bool(prior_turns)
+        ),
+        turns=list(prior_turns),
     )
-    if session is not None:
-        evaluator_session.turns = list(session.turns)
     evaluator_session.add("user", user_query)
 
     style_enabled = start_evaluator_style()
     try:
-        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}) ---\n")
+        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}, {label}) ---\n")
         evaluator_response = stream_generate_content(
             EVALUATOR_MODEL,
             evaluator_session,
@@ -477,7 +536,18 @@ def respond(
 
     Static instructions go in systemInstruction; history is native prior
     turns; the query and the evaluator's analysis are separate user turns.
+    ``session`` is only passed when the history gate decided the query needs
+    prior turns; otherwise the responder is told not to invent earlier turns.
+    If the model forgets the FINAL_ANSWER: marker (it leaks analysis), the
+    responder is asked once more to comply.
     """
+    history_hint = (
+        "Conversation history is attached as prior turns; you may reference "
+        "earlier turns when relevant.\n\n"
+        if session is not None
+        else "No conversation history is attached for this query; answer from "
+        "the evaluator context alone and do not invent earlier turns.\n\n"
+    )
     responder_session = Session(
         system_instruction=(
             "You are the final responder agent. Produce exactly one final answer "
@@ -487,9 +557,9 @@ def respond(
             "- Do not write anything before FINAL_ANSWER.\n"
             "- Do not mention roles, evaluator, intent recognition, routing, YAML, prompt templates, or this task.\n"
             "- Do not quote the final answer.\n"
-            "- Do not provide alternatives, analysis, bullet points, labels, or explanations.\n"
-            "- You may reference earlier turns from the conversation history when relevant.\n\n"
-            "Intent recognition YAML prompt template loaded from intent_prompt.yaml:\n"
+            "- Do not provide alternatives, analysis, bullet points, labels, or explanations.\n\n"
+            + history_hint
+            + "Intent recognition YAML prompt template loaded from intent_prompt.yaml:\n"
             f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
             f"Parsed YAML prompt instruction:\n{intent_template.prompt}"
         )
@@ -502,14 +572,51 @@ def respond(
         f"Full evaluator response from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
         "Now write only the final answer for the end user.",
     )
-    return clean_final_answer(stream_generate_content(RESPONDER_MODEL, responder_session))
+
+    text = stream_generate_content(RESPONDER_MODEL, responder_session)
+    if "FINAL_ANSWER:" not in text:
+        responder_session.add(
+            "user",
+            "Your previous output did not contain the required FINAL_ANSWER: "
+            "marker. Output exactly one line in this format: FINAL_ANSWER: <answer>",
+        )
+        text = stream_generate_content(RESPONDER_MODEL, responder_session)
+    return clean_final_answer(text)
 
 
 def ask(message: str, session: Session | None = None) -> str:
-    """Run the complete multi-agent workflow and return the final response."""
+    """Run the complete multi-agent workflow and return the final response.
+
+    History gate: the evaluator first sees ONLY the current query (zero prior
+    turns) and flags whether the query depends on conversation history. Only
+    when it does are prior turns attached to a second evaluator pass and to
+    the responder — standalone queries never pay for history tokens.
+    """
     intent_template = load_intent_prompt_template()
-    evaluator_response = evaluate_intent(message, intent_template, session)
-    return respond(message, intent_template, evaluator_response, session)
+    prior_turns = list(session.turns) if session is not None else []
+
+    gate_analysis = run_evaluator_pass(
+        message, intent_template, [], label="history gate"
+    )
+    needs_history = parse_needs_history(gate_analysis)
+    if needs_history is None:
+        print_evaluator(
+            "(gate flag missing; assuming history is needed when available)\n"
+        )
+        needs_history = bool(prior_turns)
+    needs_history = needs_history and bool(prior_turns)
+
+    if needs_history:
+        print_evaluator("--- History needed; re-running evaluator with prior turns ---\n")
+        evaluator_response = run_evaluator_pass(
+            message, intent_template, prior_turns, label="history pass"
+        )
+    else:
+        print_evaluator("--- No history needed for this query ---\n")
+        evaluator_response = gate_analysis
+
+    history_session = session if needs_history else None
+    return respond(message, intent_template, evaluator_response, history_session)
 
 
 def run_repl(session: Session, history_path: Path | None = None) -> int:
