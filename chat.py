@@ -4,13 +4,21 @@
 Workflow:
     user query -> evaluator (gemma-4-31b-it) reads intent_prompt.yaml
     -> streams its intent analysis in real time
-    -> responder (gemma-4-26b-a4b-it) produces the final answer
+    -> responder (gemma-4-26b-a4b-it) streams the final answer
+
+History context:
+    Prior turns (user + assistant) are injected into both agents so follow-up
+    queries are answered in context. An interactive session keeps history in
+    memory; --history FILE persists it as JSON across runs.
 
 This uses a Gemini Console / Google AI Studio API key.
 
 Usage:
-    python chat.py          # sends "hi"
-    python chat.py "Hello" # sends a custom one-shot message
+    python chat.py                              # interactive session
+    python chat.py "Hello"                      # one-shot message
+    python chat.py --history chat.json "Hi"     # one-shot with saved history
+    python chat.py --history chat.json          # interactive, auto-saved
+    python chat.py --history chat.json --reset  # ignore existing history
 """
 
 from __future__ import annotations
@@ -280,6 +288,10 @@ def generate_content(model: str, prompt: str) -> str:
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach {model} API: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"{model} API request timed out after 60s (no response received)"
+        ) from exc
 
     text = extract_text(data).strip()
     if not text:
@@ -332,6 +344,12 @@ def stream_generate_content(
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach {model} streaming API: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"{model} streaming API request timed out after 60s"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"{model} streaming API connection error: {exc}") from exc
 
     text = "".join(chunks).strip()
     if not text:
@@ -408,7 +426,13 @@ def respond(
     evaluator_response: str,
     history: list[ChatTurn] | None = None,
 ) -> str:
-    """Ask the 26B responder to produce the final end-user response."""
+    """Ask the 26B responder to produce the final end-user response.
+
+    The responder uses the streaming endpoint too (like the evaluator) so
+    output is produced incrementally instead of one blocking read, which is
+    more resilient against long generations; the final answer is still printed
+    only once, complete, after streaming finishes.
+    """
     history_text = format_history(history or [])
     history_section = (
         f"\nConversation history (prior turns):\n{history_text}\n"
@@ -441,7 +465,7 @@ Full evaluator response from {EVALUATOR_MODEL}:
 {evaluator_response}
 
 Now write only the final answer for the end user."""
-    return clean_final_answer(generate_content(RESPONDER_MODEL, responder_input))
+    return clean_final_answer(stream_generate_content(RESPONDER_MODEL, responder_input))
 
 
 def ask(message: str, history: list[ChatTurn] | None = None) -> str:
