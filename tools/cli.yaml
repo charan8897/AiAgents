@@ -1,0 +1,230 @@
+# =============================================================================
+# tools/cli.yaml — CLI tool configuration (layer 1: flags & defaults)
+#
+# This YAML defines the first processing layer for the agent CLI tool:
+#   - Directory discovery flow (prompt → working directory)
+#   - Default limits and permission mode
+#   - Normalized request schema derived from the above
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. DIRECTORY DISCOVERY
+# ---------------------------------------------------------------------------
+# The agent begins by identifying the target working directory.
+# It runs a discovery prompt and, once resolved, sets the result as `cwd`.
+# ---------------------------------------------------------------------------
+directory_discovery:
+  enabled: true
+
+  # Prompt shown to the user / used by the agent to locate the workspace.
+  prompt: |
+    Which directory should we work in?
+    - Provide a full path (e.g., /home/user/my-project), or
+    - press Enter to use the current working directory.
+    The agent will scan the resolved directory for relevant context before
+    proceeding with the objective.
+
+  # Fallback when the user provides no input.
+  default_cwd: "{cwd}"  # resolved to the process working directory at launch
+
+  # After discovery, the tool changes to this directory for all subsequent
+  # commands. All relative paths in the request are rebased against this value.
+  set_working_dir: true
+
+# ---------------------------------------------------------------------------
+# 2. DEFAULT LIMITS
+# ---------------------------------------------------------------------------
+# These values act as the baseline when the user/request does not supply
+# explicit overrides. The normalized request (section 4) merges them.
+# ---------------------------------------------------------------------------
+limits:
+
+  # Maximum number of execution steps (tool calls) per request.
+  max_steps: 15
+
+  # Number of times a single step can be retried on failure before giving up.
+  max_retries_per_step: 2
+
+  # Maximum number of re-plans allowed when execution confidence drops below
+  # the confidence threshold (see confidence_threshold below).
+  max_replans: 1
+
+  # Confidence threshold (0.0 – 1.0) that triggers a re-plan.
+  # When the executor's confidence in the current plan falls at or below
+  # this value, a re-plan cycle is initiated (up to max_replans times).
+  confidence_threshold: 0.4
+
+  # Timeout configuration.
+  # Each "iteration call" (evaluator → responder → executor) has its own
+  # timeout, evaluated dynamically based on the situation rather than a
+  # static value. The fields below describe the policy.
+  timeout:
+    # Strategy: "flexible" means the timeout is computed per iteration
+    # based on factors such as:
+    #   - complexity of the current step (expected tool duration)
+    #   - retry budget already consumed
+    #   - total elapsed time vs. max_steps remaining
+    #   - nature of the tool being invoked (e.g., fast read vs. long build)
+    strategy: flexible
+
+    # Hard upper bound (seconds) — no iteration may exceed this.
+    # This prevents runaway calls even under the flexible strategy.
+    absolute_max_seconds: 300
+
+    # The per-call breakdown follows a sequential pipeline each iteration:
+    #
+    #   User Query → [Evaluator (intent)] → [Responder (plan)] → [Executor (tool)]
+    #
+    # Each sub-call's timeout budget is derived dynamically from the overall
+    # strategy, but the system tracks them individually so a slow evaluator
+    # does not starve the executor.
+    per_call:
+      evaluator_to_responder:
+        description: >
+          Timeout for the evaluator model to analyse intent and hand off to
+          the responder. This depends on query length, context window, and
+          conversation depth.
+      responder_to_executor:
+        description: >
+          Timeout for the responder to produce a concrete execution plan
+          (tool selection & parameters) from the evaluator's analysis.
+          Longer when the evaluator output is large or ambiguous.
+      executor_tool:
+        description: >
+          Timeout for the actual tool/command execution (e.g., git log,
+          file search, script run). Heavily situational — a simple `ls`
+          can be 10 s, a build command may need several minutes.
+
+# ---------------------------------------------------------------------------
+# 3. PERMISSION MODE
+# ---------------------------------------------------------------------------
+# Controls how the agent interacts with the user before executing commands.
+# ---------------------------------------------------------------------------
+permission_mode:
+  # Supported modes:
+  #   "ask"        — Prompt the user for approval before every command.
+  #   "auto"       — Execute without asking (use with caution).
+  #   "plan_approval" — Show the full plan first, then auto-execute steps.
+  mode: ask
+
+  description: >
+    When set to "ask", every tool/command invocation is preceded by a prompt
+    showing the command, its arguments, and an estimate of impact. The user
+    must explicitly approve (Y/n) before the command runs. This is the safest
+    default for exploratory or sensitive environments.
+
+# ---------------------------------------------------------------------------
+# 4. NORMALIZED REQUEST SCHEMA
+# ---------------------------------------------------------------------------
+# The flags above (directory discovery result + limits + permission mode) are
+# assembled into a single normalized JSON request object that is passed
+# through the rest of the pipeline (evaluator → responder → executor).
+#
+# Fields marked "(derived)" are populated from the sections above after user
+# prompting / flag resolution.
+# ---------------------------------------------------------------------------
+normalized_request_schema:
+  description: >
+    The standardised request envelope consumed by the evaluator agent. It
+    merges the user's objective with the resolved configuration flags.
+
+  example:
+    request_id: "req_123"                          # (generated)
+    objective: "Find all TODO comments and write a report"  # (from user)
+    cwd: "/workspace/my-project"                   # (derived — directory discovery)
+    output_format: "markdown"                      # (from user or default)
+    permission_mode: "ask"                         # (derived — section 3)
+    limits:
+      max_steps: 15                                # (derived — section 2)
+      max_retries_per_step: 2                      # (derived — section 2)
+      max_replans: 1                                # (derived — section 2)
+      timeout_seconds: flexible                     # (derived — section 2 timeout strategy)
+
+  # Full field reference
+  fields:
+    request_id:
+      type: string
+      description: "Unique identifier for this request (auto-generated UUID-like token)."
+      example: "req_123"
+
+    objective:
+      type: string
+      description: "The user's natural-language goal or task description."
+      example: "Find all TODO comments and write a report"
+
+    cwd:
+      type: string
+      description: >
+        Absolute path to the working directory, resolved during the directory
+        discovery phase. All relative tool paths are rebased against this.
+      example: "/workspace/my-project"
+
+    output_format:
+      type: string
+      description: "Desired format for the final result (markdown, json, plain, etc.)."
+      default: "markdown"
+      example: "markdown"
+
+    permission_mode:
+      type: string
+      enum: ["ask", "auto", "plan_approval"]
+      description: "Permission model for command execution."
+      example: "ask"
+
+    limits:
+      type: object
+      description: "Execution constraints for this request."
+      properties:
+        max_steps:
+          type: integer
+          description: "Maximum execution steps allowed."
+          example: 15
+
+        max_retries_per_step:
+          type: integer
+          description: "Retry attempts per step on failure."
+          example: 2
+
+        max_replans:
+          type: integer
+          description: >
+            Number of times the plan may be regenerated when confidence
+            (confidence_threshold) is breached.
+          example: 1
+
+        # The confidence_threshold is not exposed directly in the request
+        # envelope — it is a system-level trigger that lives in config. It
+        # is documented here for clarity.
+        _confidence_threshold:
+          type: number
+          description: >
+            System-level threshold (0.0 – 1.0) below which a re-plan is
+            triggered. Not part of the request itself.
+          default: 0.4
+
+        timeout_seconds:
+          one_of:
+            - type: integer
+              description: "Static timeout in seconds (simple mode)."
+            - type: string
+              enum: ["flexible"]
+              description: >
+                Dynamic timeout computed per iteration based on step
+                complexity, remaining budget, retry state, and tool type.
+          example: "flexible"
+
+  # Template that the CLI fills from the discovered/configured values.
+  template: |
+    {
+      "request_id": "{request_id}",
+      "objective": "{objective}",
+      "cwd": "{cwd}",
+      "output_format": "{output_format}",
+      "permission_mode": "{permission_mode}",
+      "limits": {
+        "max_steps": {max_steps},
+        "max_retries_per_step": {max_retries_per_step},
+        "max_replans": {max_replans},
+        "timeout_seconds": "{timeout_strategy}"
+      }
+    }

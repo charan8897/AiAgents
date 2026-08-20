@@ -2,11 +2,17 @@
 """Multi-agent Gemma chat client through the Gemini API.
 
 Workflow:
-    user query -> evaluator gate pass (gemma-4-31b-it) sees ONLY the query
-    -> evaluator decides NEEDS_HISTORY true/false (no history wasted)
-    -> if true, evaluator re-runs WITH prior turns; otherwise that pass is skipped
+    user query -> evaluator (gemma-4-31b-it) reads intent_prompt.yaml
+    -> streams its intent analysis in real time
     -> responder (gemma-4-26b-a4b-it) streams the final answer
-    -> responder receives prior turns only when the gate asked for them
+
+Tool mode (--tool):
+    user query -> tools/cli.py -> normalized request JSON
+    -> evaluator (31B) <-> responder (26B) <-> executor loop:
+      - Evaluator (31B): plans, instructs 26B, quality-gates feedback
+      - Responder (26B): turns 31B instructions into shell commands
+      - Executor (subprocess): runs those commands
+      - stdout/stderr (error or success) is sent back to 31B as feedback
 
 History context:
     Conversation turns are kept as structured session data and sent to the API
@@ -14,12 +20,6 @@ History context:
     instructions carried in systemInstruction — history is never flattened
     into prompt text. An interactive session keeps the session in memory;
     --history FILE persists turns as JSON across runs.
-
-    History is fetched lazily: the evaluator's first pass gets zero history,
-    and the conversation is only attached when the query actually refers back
-    to earlier turns ("my first question", "tell me more", ambiguous follow-ups).
-    Standalone queries (greetings, new topics, self-contained facts) never pay
-    for history tokens.
 
 This uses a Gemini Console / Google AI Studio API key.
 
@@ -29,6 +29,7 @@ Usage:
     python chat.py --history chat.json "Hi"     # one-shot with saved history
     python chat.py --history chat.json          # interactive, auto-saved
     python chat.py --history chat.json --reset  # ignore existing history
+    python chat.py --tool "Find all TODOs"      # tool mode (evaluator<->executor loop)
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -66,6 +67,10 @@ INTENT_PROMPT_PATH = Path(__file__).with_name("intent_prompt.yaml")
 # transparency, so this uses dim gray text to make evaluator thinking feel muted.
 ANSI_DIM_GRAY = "\033[2;90m"
 ANSI_RESET = "\033[0m"
+ANSI_BOLD_CYAN = "\033[1;36m"
+ANSI_YELLOW = "\033[33m"
+ANSI_GREEN = "\033[32m"
+ANSI_RED = "\033[31m"
 _WINDOWS_ANSI_ENABLED: bool | None = None
 
 
@@ -415,81 +420,31 @@ def stream_to_stderr(text: str) -> None:
     print_evaluator(text)
 
 
-def evaluator_system_instruction(
-    intent_template: IntentPromptTemplate,
-    *,
-    with_history: bool,
-) -> str:
-    """Build the 31B evaluator's systemInstruction for one pass.
-
-    The gate pass (``with_history=False``) must decide whether the query needs
-    history WITHOUT seeing it; the history pass re-analyzes the query with the
-    prior turns attached. Both passes share the YAML template instructions.
-    """
-    common = (
-        "You are the evaluator agent in a two-agent workflow.\n\n"
-        "Read this exact YAML prompt template loaded from intent_prompt.yaml:\n"
-        f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
-        f"Parsed prompt instruction from YAML key `prompt`:\n{intent_template.prompt}\n\n"
-    )
-    if not with_history:
-        return (
-            common
-            + "The current user query is the only user turn in this request: "
-            "conversation history is deliberately NOT attached to save tokens. "
-            "First decide whether answering the query requires earlier turns.\n"
-            "- Say NEEDS_HISTORY: true when the query refers back to earlier turns "
-            "(e.g. \"my first question\", \"tell me more about it\", pronouns with no "
-            "clear referent, or ambiguous names that depend on prior context).\n"
-            "- Say NEEDS_HISTORY: false for standalone queries: greetings, new topics, "
-            "self-contained factual questions.\n"
-            "- When unsure, prefer true so the responder keeps the needed context.\n\n"
-            "Write your analysis exactly once (do not draft it and then repeat it), "
-            "in this format:\n\n"
-            "NEEDS_HISTORY: true or false\n"
-            "REASON: one short line\n"
-            "ROUTING_CONTEXT: concise routing context for the final responder\n"
-        )
-    return (
-        common
-        + "The current query was flagged as depending on conversation history, and "
-        "the prior turns are attached to this request. Use them to resolve referents "
-        "and write your analysis exactly once (do not draft it and then repeat it), "
-        "in this format:\n\n"
-        "ROUTING_CONTEXT: concise routing context for the final responder, including "
-        "any facts pulled from history that the responder needs to answer\n"
-    )
-
-
-def parse_needs_history(text: str) -> bool | None:
-    """Parse the NEEDS_HISTORY flag from gate output (None when absent)."""
-    match = re.search(
-        r"NEEDS_HISTORY\s*\**\s*[:=]\s*\**\s*\**\s*(true|false|yes|no)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return match.group(1).lower() in {"true", "yes"}
-
-
-def run_evaluator_pass(
+def evaluate_intent(
     user_query: str,
     intent_template: IntentPromptTemplate,
-    prior_turns: list[ChatTurn],
-    *,
-    label: str,
+    session: Session | None = None,
 ) -> str:
-    """Stream one 31B evaluator pass to stderr and return its full analysis.
+    """Stream 31B evaluator intent analysis using the YAML prompt.
 
-    ``label`` distinguishes the gate pass (no history) from the history pass.
+    The evaluator's static instructions go in systemInstruction; the
+    conversation history (if any) is sent as native prior turns, with the
+    current query as the final user turn. P3 will narrow this to a digest.
     """
     evaluator_session = Session(
-        system_instruction=evaluator_system_instruction(
-            intent_template, with_history=bool(prior_turns)
-        ),
-        turns=list(prior_turns),
+        system_instruction=(
+            "You are the evaluator agent in a two-agent workflow.\n\n"
+            "Read this exact YAML prompt template loaded from intent_prompt.yaml:\n"
+            f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
+            f"Parsed prompt instruction from YAML key `prompt`:\n{intent_template.prompt}\n\n"
+            "Analyze the user's query intent according to the YAML prompt template. "
+            "The YAML file content was provided above; do not say it is missing or implied. "
+            "Use the conversation history for context when the query refers to earlier turns. "
+            "Return your full analysis for the responder agent."
+        )
     )
+    if session is not None:
+        evaluator_session.turns = list(session.turns)
     evaluator_session.add("user", user_query)
 
     style_enabled = start_evaluator_style()
@@ -521,6 +476,7 @@ def clean_final_answer(text: str) -> str:
         answer = answer[1:-1].strip()
     return answer
 
+
 def respond(
     user_query: str,
     intent_template: IntentPromptTemplate,
@@ -536,18 +492,7 @@ def respond(
 
     Static instructions go in systemInstruction; history is native prior
     turns; the query and the evaluator's analysis are separate user turns.
-    ``session`` is only passed when the history gate decided the query needs
-    prior turns; otherwise the responder is told not to invent earlier turns.
-    If the model forgets the FINAL_ANSWER: marker (it leaks analysis), the
-    responder is asked once more to comply.
     """
-    history_hint = (
-        "Conversation history is attached as prior turns; you may reference "
-        "earlier turns when relevant.\n\n"
-        if session is not None
-        else "No conversation history is attached for this query; answer from "
-        "the evaluator context alone and do not invent earlier turns.\n\n"
-    )
     responder_session = Session(
         system_instruction=(
             "You are the final responder agent. Produce exactly one final answer "
@@ -557,9 +502,9 @@ def respond(
             "- Do not write anything before FINAL_ANSWER.\n"
             "- Do not mention roles, evaluator, intent recognition, routing, YAML, prompt templates, or this task.\n"
             "- Do not quote the final answer.\n"
-            "- Do not provide alternatives, analysis, bullet points, labels, or explanations.\n\n"
-            + history_hint
-            + "Intent recognition YAML prompt template loaded from intent_prompt.yaml:\n"
+            "- Do not provide alternatives, analysis, bullet points, labels, or explanations.\n"
+            "- You may reference earlier turns from the conversation history when relevant.\n\n"
+            "Intent recognition YAML prompt template loaded from intent_prompt.yaml:\n"
             f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
             f"Parsed YAML prompt instruction:\n{intent_template.prompt}"
         )
@@ -572,51 +517,14 @@ def respond(
         f"Full evaluator response from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
         "Now write only the final answer for the end user.",
     )
-
-    text = stream_generate_content(RESPONDER_MODEL, responder_session)
-    if "FINAL_ANSWER:" not in text:
-        responder_session.add(
-            "user",
-            "Your previous output did not contain the required FINAL_ANSWER: "
-            "marker. Output exactly one line in this format: FINAL_ANSWER: <answer>",
-        )
-        text = stream_generate_content(RESPONDER_MODEL, responder_session)
-    return clean_final_answer(text)
+    return clean_final_answer(stream_generate_content(RESPONDER_MODEL, responder_session))
 
 
 def ask(message: str, session: Session | None = None) -> str:
-    """Run the complete multi-agent workflow and return the final response.
-
-    History gate: the evaluator first sees ONLY the current query (zero prior
-    turns) and flags whether the query depends on conversation history. Only
-    when it does are prior turns attached to a second evaluator pass and to
-    the responder — standalone queries never pay for history tokens.
-    """
+    """Run the complete multi-agent workflow and return the final response."""
     intent_template = load_intent_prompt_template()
-    prior_turns = list(session.turns) if session is not None else []
-
-    gate_analysis = run_evaluator_pass(
-        message, intent_template, [], label="history gate"
-    )
-    needs_history = parse_needs_history(gate_analysis)
-    if needs_history is None:
-        print_evaluator(
-            "(gate flag missing; assuming history is needed when available)\n"
-        )
-        needs_history = bool(prior_turns)
-    needs_history = needs_history and bool(prior_turns)
-
-    if needs_history:
-        print_evaluator("--- History needed; re-running evaluator with prior turns ---\n")
-        evaluator_response = run_evaluator_pass(
-            message, intent_template, prior_turns, label="history pass"
-        )
-    else:
-        print_evaluator("--- No history needed for this query ---\n")
-        evaluator_response = gate_analysis
-
-    history_session = session if needs_history else None
-    return respond(message, intent_template, evaluator_response, history_session)
+    evaluator_response = evaluate_intent(message, intent_template, session)
+    return respond(message, intent_template, evaluator_response, session)
 
 
 def run_repl(session: Session, history_path: Path | None = None) -> int:
@@ -651,10 +559,433 @@ def run_repl(session: Session, history_path: Path | None = None) -> int:
         print(f"\nAssistant: {answer}\n")
     return 0
 
+def run_repl(session: Session, history_path: Path | None = None) -> int:
+    """Interactive multi-turn session with in-memory (and optional on-disk) history."""
+    print(
+        "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            break
+
+# ============================================================================
+# Tool mode — evaluator <-> executor feedback loop
+# ============================================================================
+
+TOOLS_CLI_PATH = Path(__file__).parent / "tools" / "cli.py"
+
+
+def _invoke_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run tools/cli.py as a subprocess and capture its JSON output.
+
+    Always passes ``--cwd`` with the current directory so the subprocess
+    doesn't block waiting for interactive directory discovery.
+    """
+    cmd = [sys.executable, str(TOOLS_CLI_PATH), "--cwd", os.getcwd(), *args]
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _tool_style_header(text: str) -> None:
+    """Print a colored tool-mode header to stderr."""
+    if evaluator_color_enabled():
+        print(f"{ANSI_BOLD_CYAN}{text}{ANSI_RESET}", file=sys.stderr, flush=True)
+    else:
+        print(f"=== {text} ===", file=sys.stderr, flush=True)
+
+
+def _parse_commands(text: str) -> list[dict[str, str]]:
+    """Extract shell commands from 26B (or 31B) output.
+
+    Looks for fenced code blocks (bash/sh/powershell/cmd/shell) or COMMAND: lines.
+    """
+    import re
+
+    commands: list[dict[str, str]] = []
+    blocks = re.findall(
+        r"```(?:bash|sh|shell|powershell|pwsh|cmd|bat)?\n(.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    for block in blocks:
+        for line in block.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                commands.append({"command": line, "source": "codeblock"})
+
+    cmd_lines = re.findall(r"^COMMAND:\s*(.+)$", text, re.MULTILINE)
+    for c in cmd_lines:
+        cmd = c.strip()
+        if cmd and not any(d.get("command") == cmd for d in commands):
+            commands.append({"command": cmd, "source": "prefix"})
+
+    return commands
+
+
+def _parse_gate(text: str) -> str | None:
+    """Extract the quality gate decision from evaluator output."""
+    import re
+
+    m = re.search(r"\bGATE:\s*(APPROVED|RETRY|REPLAN)\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # Also check for standalone keywords
+    if re.search(r"\bAPPROVED\b", text, re.IGNORECASE):
+        return "APPROVED"
+    return None
+
+
+def _normalize_command(cmd: str) -> str:
+    """Stable key so the same command is never executed twice."""
+    return " ".join(cmd.strip().split()).lower()
+
+
+def _parse_final(text: str) -> str | None:
+    """Extract the final answer from evaluator output."""
+    import re
+
+    m = re.search(r"FINAL:\s*(.*?)(?:\n|$)", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Also try FINAL_ANSWER marker
+    m = re.search(r"FINAL_ANSWER:\s*(.*?)(?:\n|$)", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _stream_model(model: str, session: Session, heading: str) -> str:
+    """Stream a model response to stderr under a labeled heading."""
+    style_enabled = start_evaluator_style()
+    try:
+        print_evaluator(f"\n--- {heading} ---\n")
+        text = stream_generate_content(model, session, on_text=stream_to_stderr)
+        print_evaluator("")
+        return text
+    finally:
+        stop_evaluator_style(style_enabled)
+
+
+def run_tool_workflow(request: dict) -> str:
+    """Evaluator (31B) instructs responder (26B); execution feeds back to 31B.
+
+    Each turn records command(s) actually run plus 31B/26B analysis. A command
+    whose normalized key is already in history is never executed again.
+    """
+    objective = request["objective"]
+    cwd = request.get("cwd", os.getcwd())
+    limits = request.get("limits", {})
+    max_steps = limits.get("max_steps", 15)
+    max_replans = limits.get("max_replans", 1)
+    permission_mode = request.get("permission_mode", "ask")
+    timeout_strategy = limits.get("timeout_seconds", "flexible")
+
+    _tool_style_header(f"TOOL MODE: {objective}")
+    print(f"   Directory:   {cwd}", file=sys.stderr)
+    print(f"   Permission:  {permission_mode}", file=sys.stderr)
+    print(f"   Max steps:   {max_steps}", file=sys.stderr)
+    print(f"   Max replans: {max_replans}", file=sys.stderr)
+    print(f"   Evaluator:   {EVALUATOR_MODEL}", file=sys.stderr)
+    print(f"   Responder:   {RESPONDER_MODEL}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    original_cwd = os.getcwd()
+    os.chdir(cwd)
+
+    turn_history: list[dict] = []
+    ran_commands: set[str] = set()
+    step_count = 0
+    replan_count = 0
+
+    def _get_timeout(step: int) -> int:
+        if isinstance(timeout_strategy, int):
+            return timeout_strategy
+        base = 30 if step <= 3 else 60
+        return min(base + (step * 10), 300)
+
+    os_name = "Windows (cmd/PowerShell)" if os.name == "nt" else "Unix"
+    evaluator_system = (
+        "You are the 31B evaluator in a two-model tool loop.\n"
+        f"The 26B responder ({RESPONDER_MODEL}) writes shell commands. "
+        "You never execute commands yourself.\n\n"
+        f"Normalized request:\n{json.dumps(request, indent=2)}\n\n"
+        f"Host OS: {os_name}. Instruct 26B to use commands that work on this OS.\n\n"
+        "YOUR ROLE:\n"
+        "1. Analyse the objective and write clear instructions for the 26B responder.\n"
+        "2. After each turn, review turn_history (commands already run, "
+        "31B/26B analysis, stdout/stderr).\n"
+        "3. GATE the result, then instruct 26B again unless APPROVED.\n\n"
+        "OUTPUT FORMAT:\n"
+        "- First line when reviewing: GATE: APPROVED | RETRY | REPLAN\n"
+        "  APPROVED: objective met. Then FINAL: <answer for the user>\n"
+        "  RETRY: errors or insufficient output. Instruct 26B with a *new* command.\n"
+        "  REPLAN: the plan was wrong. Write a new plan for 26B.\n"
+        "- Then write INSTRUCTIONS for 26B. Do not emit shell commands yourself.\n"
+        "- Never instruct harmful commands.\n"
+        "- Never ask 26B to re-run a command already listed in turn_history.\n\n"
+        f"Limits: max_steps={max_steps}, max_replans={max_replans}"
+    )
+    responder_system = (
+        "You are the 26B responder in a tool-execution loop.\n"
+        "The 31B evaluator gives you instructions. You output shell commands only.\n\n"
+        f"Host OS: {os_name}. Use grep/find on Unix; findstr or powershell on Windows.\n"
+        "Do not invent Unix tools on Windows.\n\n"
+        "OUTPUT RULES:\n"
+        "- Wrap each command in a fenced block: ```bash or ```powershell or ```cmd\n"
+        "- One command per line. No commentary except brief # comments.\n"
+        "- Never output GATE or FINAL. Never run anything; only write commands.\n"
+        "- Prefer excluding .git, node_modules, venv, __pycache__.\n"
+        "- Never repeat a command already listed in turn_history.\n"
+    )
+
+    while step_count < max_steps:
+        step_count += 1
+        timeout_sec = _get_timeout(step_count)
+
+        evaluator_session = Session(system_instruction=evaluator_system)
+        if not turn_history:
+            user_msg = (
+                f"Objective: {objective}\n\n"
+                "Write INSTRUCTIONS for the 26B responder so it can emit "
+                "OS-appropriate shell commands. Do not GATE yet."
+            )
+        else:
+            user_msg = (
+                f"Objective: {objective}\n\n"
+                "Turn history (commands already run — do not repeat them):\n"
+                f"{json.dumps(turn_history, indent=2)}\n\n"
+                "Review each turn's analysis, command, and stdout/stderr.\n"
+                "- GATE: APPROVED and FINAL: <answer> if the objective is met.\n"
+                "- GATE: RETRY plus INSTRUCTIONS for a *new* 26B command.\n"
+                "- GATE: REPLAN plus new INSTRUCTIONS if the plan was wrong.\n"
+            )
+        evaluator_session.add("user", user_msg)
+        evaluator_response = _stream_model(
+            EVALUATOR_MODEL,
+            evaluator_session,
+            f"Evaluator {EVALUATOR_MODEL} step {step_count}/{max_steps}",
+        )
+
+        gate_decision = _parse_gate(evaluator_response)
+        if gate_decision == "APPROVED":
+            final = _parse_final(evaluator_response)
+            os.chdir(original_cwd)
+            if final:
+                return final.strip()
+            for turn in reversed(turn_history):
+                for result in turn.get("results") or []:
+                    last_out = (result.get("stdout") or result.get("stderr") or "").strip()
+                    if last_out:
+                        return last_out
+            return evaluator_response.strip()
+
+        if gate_decision == "RETRY":
+            print_evaluator(f"\n{ANSI_YELLOW}31B: RETRY — instructing 26B...{ANSI_RESET}\n")
+        elif gate_decision == "REPLAN":
+            replan_count += 1
+            if replan_count > max_replans:
+                print_evaluator(
+                    f"\n{ANSI_YELLOW}Max replans ({max_replans}) reached.{ANSI_RESET}\n"
+                )
+                break
+            print_evaluator(
+                f"\n{ANSI_YELLOW}31B: REPLAN ({replan_count}/{max_replans}) "
+                f"— instructing 26B...{ANSI_RESET}\n"
+            )
+
+        already = sorted(ran_commands)
+        responder_session = Session(system_instruction=responder_system)
+        responder_session.add(
+            "user",
+            f"Objective: {objective}\n\n"
+            f"Instructions from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
+            + (
+                "Turn history (do not repeat these commands):\n"
+                f"{json.dumps(turn_history, indent=2)}\n\n"
+                if turn_history
+                else ""
+            )
+            + (
+                f"Already executed (normalized): {already}\n"
+                if already
+                else ""
+            )
+            + "Emit a *new* shell command to run now.",
+        )
+        responder_response = _stream_model(
+            RESPONDER_MODEL,
+            responder_session,
+            f"Responder {RESPONDER_MODEL} step {step_count}/{max_steps}",
+        )
+
+        commands = _parse_commands(responder_response)
+        if not commands:
+            commands = _parse_commands(evaluator_response)
+
+        turn_results: list[dict] = []
+        resp: str | None = None
+
+        if not commands:
+            turn_results.append(
+                {
+                    "command": "",
+                    "error": "26B produced no parseable commands",
+                    "stdout": "",
+                    "stderr": responder_response[:2000],
+                    "returncode": -1,
+                    "skipped": False,
+                }
+            )
+        else:
+            for cmd_info in commands:
+                cmd = cmd_info["command"].strip()
+                if not cmd:
+                    continue
+                key = _normalize_command(cmd)
+                if key in ran_commands:
+                    print_evaluator(
+                        f"  {ANSI_DIM_GRAY}Skipped duplicate: {cmd}{ANSI_RESET}"
+                    )
+                    turn_results.append(
+                        {
+                            "command": cmd,
+                            "skipped": True,
+                            "reason": "already executed this session",
+                            "stdout": "",
+                            "stderr": "",
+                            "returncode": None,
+                        }
+                    )
+                    continue
+
+                if permission_mode == "ask":
+                    print(f"\n  {ANSI_YELLOW}Command:{ANSI_RESET} {cmd}", file=sys.stderr)
+                    try:
+                        resp = input("  Execute? [Y/n/q] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        resp = "q"
+                    if resp in ("q", "quit"):
+                        print_evaluator(
+                            f"{ANSI_YELLOW}Execution cancelled by user.{ANSI_RESET}"
+                        )
+                        break
+                    if resp in ("n", "no"):
+                        print_evaluator(f"  {ANSI_DIM_GRAY}Skipped.{ANSI_RESET}")
+                        turn_results.append(
+                            {
+                                "command": cmd,
+                                "skipped": True,
+                                "reason": "user declined",
+                                "stdout": "",
+                                "stderr": "",
+                                "returncode": None,
+                            }
+                        )
+                        continue
+
+                print_evaluator(f"  -> Executing: {cmd}")
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_sec,
+                    )
+                    output = {
+                        "command": cmd,
+                        "skipped": False,
+                        "returncode": result.returncode,
+                        "stdout": result.stdout[:10000],
+                        "stderr": result.stderr[:5000],
+                    }
+                    if result.returncode == 0:
+                        print_evaluator(f"  OK (exit {result.returncode})")
+                    else:
+                        print_evaluator(f"  FAIL (exit {result.returncode})")
+                        if result.stderr.strip():
+                            print_evaluator(f"  stderr: {result.stderr.strip()[:200]}")
+                except subprocess.TimeoutExpired:
+                    output = {
+                        "command": cmd,
+                        "skipped": False,
+                        "error": f"TIMEOUT (>={timeout_sec}s)",
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": -1,
+                    }
+                    print_evaluator(f"  TIMOUT (>{timeout_sec}s)")
+                except Exception as exc:
+                    output = {
+                        "command": cmd,
+                        "skipped": False,
+                        "error": str(exc),
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": -1,
+                    }
+                    print_evaluator(f"  Error: {exc}")
+
+                ran_commands.add(key)
+                turn_results.append(output)
+
+        turn_history.append(
+            {
+                "step": step_count,
+                "gate": gate_decision,
+                "evaluator_analysis": evaluator_response[:4000],
+                "responder_output": responder_response[:2000],
+                "results": turn_results,
+            }
+        )
+
+        if resp == "q":
+            break
+
+    os.chdir(original_cwd)
+
+    outputs: list[str] = []
+    for turn in turn_history:
+        for entry in turn.get("results") or []:
+            if entry.get("skipped"):
+                continue
+            if entry.get("returncode") == 0:
+                out = (entry.get("stdout") or "").strip()
+                if out:
+                    outputs.append(out)
+            elif "error" in entry:
+                outputs.append(f"[Error] {entry['error']}")
+
+    if outputs:
+        return "\n".join(outputs)
+
+    return (
+        f"[Tool mode completed — {len(turn_history)} turn(s), "
+        f"{len(ran_commands)} unique command(s)]"
+    )
+
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Multi-agent Gemma chat client with conversation history."
+        description="Multi-agent Gemma chat client with conversation history and tool mode."
     )
     parser.add_argument(
         "message",
@@ -671,8 +1002,55 @@ def main() -> int:
         action="store_true",
         help="ignore any existing history file",
     )
+    parser.add_argument(
+        "--tool",
+        action="store_true",
+        help="Run in tool mode: evaluator->executor feedback loop",
+    )
     args = parser.parse_args()
 
+    # --- Tool mode ---
+    if args.tool:
+        message = " ".join(args.message).strip()
+        if not message:
+            print("Error: --tool requires an objective message.", file=sys.stderr)
+            return 1
+
+        # Invoke cli.py via subprocess to get normalized request JSON
+        if not TOOLS_CLI_PATH.exists():
+            print(f"Error: cli.py not found at {TOOLS_CLI_PATH}", file=sys.stderr)
+            return 1
+
+        try:
+            result = _invoke_cli(message, "--dry-run")
+        except subprocess.TimeoutExpired:
+            print("Error: cli.py subprocess timed out.", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Error invoking cli.py: {exc}", file=sys.stderr)
+            return 1
+
+        if result.returncode != 0:
+            print(f"Error from cli.py:\n{result.stderr}", file=sys.stderr)
+            return 1
+
+        try:
+            request = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            print(f"Error parsing cli.py output: {exc}\n{result.stdout}", file=sys.stderr)
+            return 1
+
+        # Run the feedback loop
+        try:
+            answer = run_tool_workflow(request)
+        except RuntimeError as exc:
+            print(f"Error in tool workflow: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"\n{answer}")
+        return 0
+
+    # --- Chat mode (existing) ---
     session = Session()
     if args.history is not None and not args.reset:
         session.turns = load_history(args.history)
