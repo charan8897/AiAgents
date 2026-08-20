@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -321,6 +322,27 @@ def extract_text(data: dict[str, object]) -> str:
         return ""
 
 
+# How many times a rate-limited (HTTP 429) request is retried after waiting
+# out the delay suggested by the API. Free-tier per-minute token quotas make
+# occasional 429s normal in long tool loops; a crash would lose all progress.
+MAX_RATE_LIMIT_RETRIES = 3
+
+
+def _parse_retry_delay(body: str, default: float = 20.0) -> float:
+    """Extract the suggested retry delay (seconds) from a 429 error body."""
+    import re
+
+    m = re.search(r'"retryDelay"\s*:\s*"([\d.]+)s?"', body)
+    if not m:
+        m = re.search(r"retry in ([\d.]+)\s*s", body, re.IGNORECASE)
+    try:
+        delay = float(m.group(1)) if m else default
+    except ValueError:
+        delay = default
+    # Small buffer so we don't re-hit the window edge; cap to stay responsive.
+    return min(delay + 2.0, 75.0)
+
+
 def _call_gemini(
     model: str,
     payload: dict[str, object],
@@ -328,11 +350,14 @@ def _call_gemini(
     stream: bool,
     on_text: Callable[[str], None] | None = None,
     _retried: bool = False,
+    _rate_limit_attempt: int = 0,
 ) -> str:
     """POST a payload to Gemini and return the generated text.
 
     Handles HTTP/network/timeout errors as RuntimeError. If the model rejects
-    systemInstruction (HTTP 400), retries once without it.
+    systemInstruction (HTTP 400), retries once without it. If the request is
+    rate-limited (HTTP 429), waits out the API-suggested delay and retries up
+    to MAX_RATE_LIMIT_RETRIES times before giving up.
     """
     url = build_api_url(model, stream=stream)
     request = urllib.request.Request(
@@ -382,6 +407,24 @@ def _call_gemini(
             return text
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 429 and _rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+            delay = _parse_retry_delay(body)
+            print(
+                f"\n[rate-limited] {model}: quota window hit; waiting "
+                f"{delay:.0f}s then retrying "
+                f"({_rate_limit_attempt + 1}/{MAX_RATE_LIMIT_RETRIES})...",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            return _call_gemini(
+                model,
+                payload,
+                stream=stream,
+                on_text=on_text,
+                _retried=_retried,
+                _rate_limit_attempt=_rate_limit_attempt + 1,
+            )
         if (
             not _retried
             and exc.code == 400
@@ -390,7 +433,12 @@ def _call_gemini(
         ):
             stripped = {k: v for k, v in payload.items() if k != "system_instruction"}
             return _call_gemini(
-                model, stripped, stream=stream, on_text=on_text, _retried=True
+                model,
+                stripped,
+                stream=stream,
+                on_text=on_text,
+                _retried=True,
+                _rate_limit_attempt=_rate_limit_attempt,
             )
         kind = "streaming " if stream else ""
         raise RuntimeError(
@@ -720,30 +768,82 @@ def _tool_style_header(text: str) -> None:
         print(f"=== {text} ===", file=sys.stderr, flush=True)
 
 
+def _looks_like_powershell(line: str) -> bool:
+    """Heuristic: does this line look like a PowerShell statement?"""
+    import re
+
+    return bool(
+        re.match(
+            r"^(\$\w|\[\w+(\.\w+)*\]::|"
+            r"(Get|Set|New|Remove|Start|Stop|Write|Read|Select|Sort|Measure|"
+            r"Format|Test|Invoke|Import|Export|Out|Clear|Add|Copy|Move|"
+            r"Restart|Enable|Disable|Update)-\w+)",
+            line,
+        )
+    )
+
+
+def _as_powershell_command(script_lines: list[str]) -> str:
+    """Join PowerShell lines into a single `powershell -Command` invocation.
+
+    Executing PowerShell cmdlets line-by-line through the default shell
+    (cmd.exe on Windows) fails with \"'Get-Process' is not recognized...\";
+    the whole block must run inside one PowerShell process instead.
+    """
+    script = "; ".join(script_lines)
+    script = script.replace('"', '\\"')
+    exe = "powershell -NoProfile" if os.name == "nt" else "pwsh -NoProfile"
+    return f'{exe} -Command "{script}"'
+
+
 def _parse_commands(text: str) -> list[dict[str, str]]:
     """Extract shell commands from 26B (or 31B) output.
 
-    Looks for fenced code blocks (bash/sh/powershell/cmd/shell) or COMMAND: lines.
+    Looks for fenced code blocks (bash/sh/powershell/cmd/shell) or COMMAND:
+    lines. A ```powershell block is executed as ONE `powershell -Command`
+    call (multi-line scripts stay intact); on Windows, stray lines that look
+    like PowerShell are wrapped the same way so cmd.exe never chokes on them.
     """
     import re
 
     commands: list[dict[str, str]] = []
-    blocks = re.findall(
-        r"```(?:bash|sh|shell|powershell|pwsh|cmd|bat)?\n(.*?)```",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    for block in blocks:
-        for line in block.split("\n"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                commands.append({"command": line, "source": "codeblock"})
 
-    cmd_lines = re.findall(r"^COMMAND:\s*(.+)$", text, re.MULTILINE)
-    for c in cmd_lines:
-        cmd = c.strip()
+    def _add(cmd: str, source: str) -> None:
+        cmd = cmd.strip()
         if cmd and not any(d.get("command") == cmd for d in commands):
-            commands.append({"command": cmd, "source": "prefix"})
+            commands.append({"command": cmd, "source": source})
+
+    blocks = re.findall(r"```([A-Za-z]*)[ \t]*\n(.*?)```", text, re.DOTALL)
+    for lang, block in blocks:
+        lang = lang.lower()
+        if lang not in ("", "bash", "sh", "shell", "powershell", "pwsh", "cmd", "bat"):
+            continue
+        lines = [ln.strip() for ln in block.split("\n")]
+        lines = [ln for ln in lines if ln and not ln.startswith("#")]
+        if not lines:
+            continue
+
+        is_ps_block = lang in ("powershell", "pwsh")
+        already_wrapped = all(
+            ln.lower().startswith(("powershell", "pwsh")) for ln in lines
+        )
+        if is_ps_block and not already_wrapped:
+            # Keep the whole script together in one PowerShell process.
+            _add(_as_powershell_command(lines), "psblock")
+            continue
+
+        for ln in lines:
+            if (
+                os.name == "nt"
+                and not ln.lower().startswith(("powershell", "pwsh"))
+                and _looks_like_powershell(ln)
+            ):
+                _add(_as_powershell_command([ln]), "psline")
+            else:
+                _add(ln, "codeblock")
+
+    for c in re.findall(r"^COMMAND:\s*(.+)$", text, re.MULTILINE):
+        _add(c.strip(), "prefix")
 
     return commands
 
@@ -767,16 +867,17 @@ def _normalize_command(cmd: str) -> str:
 
 
 def _parse_final(text: str) -> str | None:
-    """Extract the final answer from evaluator output."""
+    """Extract the final answer from evaluator output.
+
+    Captures everything after the FINAL:/FINAL_ANSWER: marker to the end of
+    the text (multi-line answers included), not just the first line.
+    """
     import re
 
-    m = re.search(r"FINAL:\s*(.*?)(?:\n|$)", text, re.DOTALL)
+    m = re.search(r"\bFINAL(?:_ANSWER)?:\s*(.*)", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
-    # Also try FINAL_ANSWER marker
-    m = re.search(r"FINAL_ANSWER:\s*(.*?)(?:\n|$)", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
+        answer = m.group(1).strip()
+        return answer or None
     return None
 
 
@@ -790,6 +891,49 @@ def _stream_model(model: str, session: Session, heading: str) -> str:
         return text
     finally:
         stop_evaluator_style(style_enabled)
+
+
+def _compact_turn_history(turn_history: list[dict], max_turns: int = 5) -> list[dict]:
+    """Trim turn history for model prompts to keep input tokens in budget.
+
+    The full history (with 10KB stdouts) re-sent every step is what blows the
+    free-tier per-minute input-token quota (HTTP 429). Models only need the
+    recent turns and truncated outputs; the full data stays in turn_history
+    for the final answer.
+    """
+    compact: list[dict] = []
+    for turn in turn_history[-max_turns:]:
+        results = []
+        for r in turn.get("results") or []:
+            entry: dict = {
+                "command": (r.get("command") or "")[:300],
+                "returncode": r.get("returncode"),
+            }
+            if r.get("skipped"):
+                entry["skipped"] = True
+                entry["reason"] = r.get("reason", "")
+            if r.get("error"):
+                entry["error"] = str(r["error"])[:200]
+            stdout = (r.get("stdout") or "").strip()
+            stderr = (r.get("stderr") or "").strip()
+            if stdout:
+                entry["stdout"] = stdout[-1200:]
+            if stderr:
+                entry["stderr"] = stderr[-400:]
+            results.append(entry)
+        compact.append(
+            {
+                "step": turn.get("step"),
+                "gate": turn.get("gate"),
+                "evaluator_analysis": (turn.get("evaluator_analysis") or "")[:600],
+                "responder_output": (turn.get("responder_output") or "")[:300],
+                "results": results,
+            }
+        )
+    omitted = len(turn_history) - max_turns
+    if omitted > 0:
+        compact.insert(0, {"note": f"{omitted} earlier turn(s) omitted for brevity"})
+    return compact
 
 
 def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> str:
@@ -824,6 +968,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
     ran_commands: set[str] = set()
     step_count = 0
     replan_count = 0
+    interrupted: str | None = None
 
     def _get_timeout(step: int) -> int:
         if isinstance(timeout_strategy, int):
@@ -876,7 +1021,12 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
         "Do not invent Unix tools on Windows.\n\n"
         "OUTPUT RULES:\n"
         "- Wrap each command in a fenced block: ```bash or ```powershell or ```cmd\n"
-        "- One command per line. No commentary except brief # comments.\n"
+        "- A ```powershell block is executed as ONE PowerShell script, so "
+        "multi-line PowerShell is fine there — but NEVER put PowerShell "
+        "cmdlets (Get-*, Write-Host, $vars, if{}) in a ```cmd block; cmd.exe "
+        "cannot run them.\n"
+        "- In ```bash/```cmd blocks: one command per line. No commentary "
+        "except brief # comments.\n"
         "- Never output GATE or FINAL. Never run anything; only write commands.\n"
         "- Prefer excluding .git, node_modules, venv, __pycache__.\n"
         "- Never repeat a command already listed in turn_history.\n"
@@ -897,18 +1047,23 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
             user_msg = (
                 f"Objective: {objective}\n\n"
                 "Turn history (commands already run — do not repeat them):\n"
-                f"{json.dumps(turn_history, indent=2)}\n\n"
+                f"{json.dumps(_compact_turn_history(turn_history), indent=2)}\n\n"
                 "Review each turn's analysis, command, and stdout/stderr.\n"
                 "- GATE: APPROVED and FINAL: <answer> if the objective is met.\n"
                 "- GATE: RETRY plus INSTRUCTIONS for a *new* 26B command.\n"
                 "- GATE: REPLAN plus new INSTRUCTIONS if the plan was wrong.\n"
             )
         evaluator_session.add("user", user_msg)
-        evaluator_response = _stream_model(
-            EVALUATOR_MODEL,
-            evaluator_session,
-            f"Evaluator {EVALUATOR_MODEL} step {step_count}/{max_steps}",
-        )
+        try:
+            evaluator_response = _stream_model(
+                EVALUATOR_MODEL,
+                evaluator_session,
+                f"Evaluator {EVALUATOR_MODEL} step {step_count}/{max_steps}",
+            )
+        except RuntimeError as exc:
+            interrupted = str(exc)
+            print_evaluator(f"\n{ANSI_RED}Evaluator call failed: {exc}{ANSI_RESET}\n")
+            break
 
         gate_decision = _parse_gate(evaluator_response)
         if gate_decision == "APPROVED":
@@ -945,7 +1100,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
             f"Instructions from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
             + (
                 "Turn history (do not repeat these commands):\n"
-                f"{json.dumps(turn_history, indent=2)}\n\n"
+                f"{json.dumps(_compact_turn_history(turn_history), indent=2)}\n\n"
                 if turn_history
                 else ""
             )
@@ -956,11 +1111,16 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
             )
             + "Emit a *new* shell command to run now.",
         )
-        responder_response = _stream_model(
-            RESPONDER_MODEL,
-            responder_session,
-            f"Responder {RESPONDER_MODEL} step {step_count}/{max_steps}",
-        )
+        try:
+            responder_response = _stream_model(
+                RESPONDER_MODEL,
+                responder_session,
+                f"Responder {RESPONDER_MODEL} step {step_count}/{max_steps}",
+            )
+        except RuntimeError as exc:
+            interrupted = str(exc)
+            print_evaluator(f"\n{ANSI_RED}Responder call failed: {exc}{ANSI_RESET}\n")
+            break
 
         commands = _parse_commands(responder_response)
         if not commands:
@@ -1089,16 +1249,36 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
     os.chdir(original_cwd)
 
     outputs: list[str] = []
+    executed: list[str] = []
     for turn in turn_history:
         for entry in turn.get("results") or []:
             if entry.get("skipped"):
                 continue
+            cmd = (entry.get("command") or "").strip()
+            if cmd:
+                executed.append(cmd)
             if entry.get("returncode") == 0:
                 out = (entry.get("stdout") or "").strip()
                 if out:
                     outputs.append(out)
             elif "error" in entry:
                 outputs.append(f"[Error] {entry['error']}")
+
+    if interrupted:
+        # Return partial progress instead of raising, so the answer is stored
+        # in conversation history and a follow-up "continue" has context.
+        parts = [
+            f"[Tool run interrupted after {len(turn_history)} completed turn(s): "
+            f"{interrupted[:300]}]"
+        ]
+        if executed:
+            parts.append(
+                "Commands already executed:\n" + "\n".join(f"- {c}" for c in executed)
+            )
+        if outputs:
+            parts.append("Partial output:\n" + "\n".join(outputs)[-3000:])
+        parts.append("Ask me to continue and I will pick up from here.")
+        return "\n\n".join(parts)
 
     if outputs:
         return "\n".join(outputs)
