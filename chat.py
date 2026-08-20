@@ -40,6 +40,14 @@ from typing import Callable
 RESPONDER_MODEL = "gemma-4-26b-a4b-it"
 EVALUATOR_MODEL = "gemma-4-31b-it"
 
+# Socket timeout in seconds for each API request/read. Streaming keeps the
+# connection alive between tokens, so this only caps idle/stalled requests.
+# Override with the CHAT_TIMEOUT environment variable (in seconds).
+try:
+    REQUEST_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "120"))
+except ValueError:
+    REQUEST_TIMEOUT = 120
+
 ENV_PATH = Path(__file__).with_name(".env")
 INTENT_PROMPT_PATH = Path(__file__).with_name("intent_prompt.yaml")
 
@@ -279,7 +287,7 @@ def generate_content(model: str, prompt: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -290,7 +298,7 @@ def generate_content(model: str, prompt: str) -> str:
         raise RuntimeError(f"Could not reach {model} API: {exc.reason}") from exc
     except TimeoutError as exc:
         raise RuntimeError(
-            f"{model} API request timed out after 60s (no response received)"
+            f"{model} API request timed out after {REQUEST_TIMEOUT}s (no response received)"
         ) from exc
 
     text = extract_text(data).strip()
@@ -315,7 +323,7 @@ def stream_generate_content(
     chunks: list[str] = []
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or not line.startswith("data:"):
@@ -346,7 +354,7 @@ def stream_generate_content(
         raise RuntimeError(f"Could not reach {model} streaming API: {exc.reason}") from exc
     except TimeoutError as exc:
         raise RuntimeError(
-            f"{model} streaming API request timed out after 60s"
+            f"{model} streaming API request timed out after {REQUEST_TIMEOUT}s"
         ) from exc
     except OSError as exc:
         raise RuntimeError(f"{model} streaming API connection error: {exc}") from exc
