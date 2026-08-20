@@ -874,9 +874,11 @@ def _parse_final(text: str) -> str | None:
     """
     import re
 
-    m = re.search(r"\bFINAL(?:_ANSWER)?:\s*(.*)", text, re.DOTALL)
+    m = list(re.finditer(r"\bFINAL(?:_ANSWER)?:\s*", text))
     if m:
-        answer = m.group(1).strip()
+        # Use the LAST marker: evaluators often mention "FINAL:" while
+        # planning before emitting the actual final answer.
+        answer = text[m[-1].end():].strip()
         return answer or None
     return None
 
@@ -891,6 +893,30 @@ def _stream_model(model: str, session: Session, heading: str) -> str:
         return text
     finally:
         stop_evaluator_style(style_enabled)
+
+
+def _print_command_output(stdout: str, stderr: str, *, limit: int = 2000) -> None:
+    """Show executed-command output in the tool log so the user sees results.
+
+    Previously only "OK (exit 0)" was printed and the actual stdout (temp
+    sizes, Defender status, ...) was visible to the evaluator model only.
+    """
+    out = (stdout or "").strip()
+    err = (stderr or "").strip()
+    if out:
+        shown = out[:limit]
+        for line in shown.splitlines():
+            print_evaluator(f"  | {line}\n")
+        if len(out) > limit:
+            print_evaluator(
+                f"  | ... ({len(out) - limit} more characters truncated)\n"
+            )
+    if err:
+        shown = err[:600]
+        for line in shown.splitlines():
+            print_evaluator(f"  ! {line}\n")
+        if len(err) > 600:
+            print_evaluator(f"  ! ... ({len(err) - 600} more characters truncated)\n")
 
 
 def _compact_turn_history(turn_history: list[dict], max_turns: int = 5) -> list[dict]:
@@ -1148,7 +1174,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                 key = _normalize_command(cmd)
                 if key in ran_commands:
                     print_evaluator(
-                        f"  {ANSI_DIM_GRAY}Skipped duplicate: {cmd}{ANSI_RESET}"
+                        f"  {ANSI_DIM_GRAY}Skipped duplicate: {cmd}{ANSI_RESET}\n"
                     )
                     turn_results.append(
                         {
@@ -1170,11 +1196,11 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                         resp = "q"
                     if resp in ("q", "quit"):
                         print_evaluator(
-                            f"{ANSI_YELLOW}Execution cancelled by user.{ANSI_RESET}"
+                            f"{ANSI_YELLOW}Execution cancelled by user.{ANSI_RESET}\n"
                         )
                         break
                     if resp in ("n", "no"):
-                        print_evaluator(f"  {ANSI_DIM_GRAY}Skipped.{ANSI_RESET}")
+                        print_evaluator(f"  {ANSI_DIM_GRAY}Skipped.{ANSI_RESET}\n")
                         turn_results.append(
                             {
                                 "command": cmd,
@@ -1187,7 +1213,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                         )
                         continue
 
-                print_evaluator(f"  -> Executing: {cmd}")
+                print_evaluator(f"  -> Executing: {cmd}\n")
                 try:
                     result = subprocess.run(
                         cmd,
@@ -1204,11 +1230,10 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                         "stderr": result.stderr[:5000],
                     }
                     if result.returncode == 0:
-                        print_evaluator(f"  OK (exit {result.returncode})")
+                        print_evaluator(f"  OK (exit {result.returncode})\n")
                     else:
-                        print_evaluator(f"  FAIL (exit {result.returncode})")
-                        if result.stderr.strip():
-                            print_evaluator(f"  stderr: {result.stderr.strip()[:200]}")
+                        print_evaluator(f"  FAIL (exit {result.returncode})\n")
+                    _print_command_output(result.stdout, result.stderr)
                 except subprocess.TimeoutExpired:
                     output = {
                         "command": cmd,
@@ -1218,7 +1243,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                         "stderr": "",
                         "returncode": -1,
                     }
-                    print_evaluator(f"  TIMOUT (>{timeout_sec}s)")
+                    print_evaluator(f"  TIMEOUT (>{timeout_sec}s)\n")
                 except Exception as exc:
                     output = {
                         "command": cmd,
@@ -1228,7 +1253,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
                         "stderr": "",
                         "returncode": -1,
                     }
-                    print_evaluator(f"  Error: {exc}")
+                    print_evaluator(f"  Error: {exc}\n")
 
                 ran_commands.add(key)
                 turn_results.append(output)
