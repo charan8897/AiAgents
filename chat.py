@@ -631,6 +631,11 @@ def _parse_gate(text: str) -> str | None:
     return None
 
 
+def _normalize_command(cmd: str) -> str:
+    """Stable key so the same command is never executed twice."""
+    return " ".join(cmd.strip().split()).lower()
+
+
 def _parse_final(text: str) -> str | None:
     """Extract the final answer from evaluator output."""
     import re
@@ -660,20 +665,13 @@ def _stream_model(model: str, session: Session, heading: str) -> str:
 def run_tool_workflow(request: dict) -> str:
     """Evaluator (31B) instructs responder (26B); execution feeds back to 31B.
 
-    Flow:
-      1. EVALUATOR (31B): analyse objective, write instructions for 26B
-      2. RESPONDER (26B): emit shell commands from those instructions
-      3. EXECUTOR: run 26B's commands
-      4. Feedback: stdout/stderr (error or sufficient/insufficient) -> 31B
-      5. 31B GATEs APPROVED / RETRY / REPLAN, then instructs 26B again
-
-    Loop ends on GATE: APPROVED, max_steps, or max_replans.
+    Each turn records command(s) actually run plus 31B/26B analysis. A command
+    whose normalized key is already in history is never executed again.
     """
     objective = request["objective"]
     cwd = request.get("cwd", os.getcwd())
     limits = request.get("limits", {})
     max_steps = limits.get("max_steps", 15)
-    max_retries_per_step = limits.get("max_retries_per_step", 2)
     max_replans = limits.get("max_replans", 1)
     permission_mode = request.get("permission_mode", "ask")
     timeout_strategy = limits.get("timeout_seconds", "flexible")
@@ -690,7 +688,8 @@ def run_tool_workflow(request: dict) -> str:
     original_cwd = os.getcwd()
     os.chdir(cwd)
 
-    execution_history: list[dict] = []
+    turn_history: list[dict] = []
+    ran_commands: set[str] = set()
     step_count = 0
     replan_count = 0
 
@@ -709,22 +708,18 @@ def run_tool_workflow(request: dict) -> str:
         f"Host OS: {os_name}. Instruct 26B to use commands that work on this OS.\n\n"
         "YOUR ROLE:\n"
         "1. Analyse the objective and write clear instructions for the 26B responder.\n"
-        "2. After execution feedback, review stdout/stderr:\n"
-        "   - CHECK_FOR_ERRORS: error messages or non-zero exit?\n"
-        "   - CHECK_CONTENT: is the output enough for the objective?\n"
-        "   - CHECK_COMPLETENESS: is the objective fully met?\n"
+        "2. After each turn, review turn_history (commands already run, "
+        "31B/26B analysis, stdout/stderr).\n"
         "3. GATE the result, then instruct 26B again unless APPROVED.\n\n"
         "OUTPUT FORMAT:\n"
         "- First line when reviewing: GATE: APPROVED | RETRY | REPLAN\n"
         "  APPROVED: objective met. Then FINAL: <answer for the user>\n"
-        "  RETRY: errors or insufficient output. Explain the fix for 26B.\n"
+        "  RETRY: errors or insufficient output. Instruct 26B with a *new* command.\n"
         "  REPLAN: the plan was wrong. Write a new plan for 26B.\n"
-        "- Then write INSTRUCTIONS: a paragraph telling 26B exactly what "
-        "commands to produce (OS-appropriate). Do not emit shell commands "
-        "yourself unless 26B is unavailable.\n"
-        "- Never instruct harmful commands.\n\n"
-        f"Limits: max_steps={max_steps}, max_retries_per_step={max_retries_per_step}, "
-        f"max_replans={max_replans}"
+        "- Then write INSTRUCTIONS for 26B. Do not emit shell commands yourself.\n"
+        "- Never instruct harmful commands.\n"
+        "- Never ask 26B to re-run a command already listed in turn_history.\n\n"
+        f"Limits: max_steps={max_steps}, max_replans={max_replans}"
     )
     responder_system = (
         "You are the 26B responder in a tool-execution loop.\n"
@@ -736,6 +731,7 @@ def run_tool_workflow(request: dict) -> str:
         "- One command per line. No commentary except brief # comments.\n"
         "- Never output GATE or FINAL. Never run anything; only write commands.\n"
         "- Prefer excluding .git, node_modules, venv, __pycache__.\n"
+        "- Never repeat a command already listed in turn_history.\n"
     )
 
     while step_count < max_steps:
@@ -743,7 +739,7 @@ def run_tool_workflow(request: dict) -> str:
         timeout_sec = _get_timeout(step_count)
 
         evaluator_session = Session(system_instruction=evaluator_system)
-        if not execution_history:
+        if not turn_history:
             user_msg = (
                 f"Objective: {objective}\n\n"
                 "Write INSTRUCTIONS for the 26B responder so it can emit "
@@ -752,11 +748,11 @@ def run_tool_workflow(request: dict) -> str:
         else:
             user_msg = (
                 f"Objective: {objective}\n\n"
-                f"Execution feedback (step {step_count}):\n"
-                f"{json.dumps(execution_history, indent=2)}\n\n"
-                "Review stdout/stderr above (error or sufficient/insufficient).\n"
+                "Turn history (commands already run — do not repeat them):\n"
+                f"{json.dumps(turn_history, indent=2)}\n\n"
+                "Review each turn's analysis, command, and stdout/stderr.\n"
                 "- GATE: APPROVED and FINAL: <answer> if the objective is met.\n"
-                "- GATE: RETRY plus INSTRUCTIONS for 26B if errors or weak output.\n"
+                "- GATE: RETRY plus INSTRUCTIONS for a *new* 26B command.\n"
                 "- GATE: REPLAN plus new INSTRUCTIONS if the plan was wrong.\n"
             )
         evaluator_session.add("user", user_msg)
@@ -772,11 +768,11 @@ def run_tool_workflow(request: dict) -> str:
             os.chdir(original_cwd)
             if final:
                 return final.strip()
-            if execution_history:
-                last = execution_history[-1]
-                last_out = last.get("stdout", last.get("stderr", "")).strip()
-                if last_out:
-                    return last_out
+            for turn in reversed(turn_history):
+                for result in turn.get("results") or []:
+                    last_out = (result.get("stdout") or result.get("stderr") or "").strip()
+                    if last_out:
+                        return last_out
             return evaluator_response.strip()
 
         if gate_decision == "RETRY":
@@ -793,17 +789,24 @@ def run_tool_workflow(request: dict) -> str:
                 f"— instructing 26B...{ANSI_RESET}\n"
             )
 
+        already = sorted(ran_commands)
         responder_session = Session(system_instruction=responder_system)
         responder_session.add(
             "user",
             f"Objective: {objective}\n\n"
             f"Instructions from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
             + (
-                f"Last execution feedback:\n{json.dumps(execution_history[-3:], indent=2)}\n"
-                if execution_history
+                "Turn history (do not repeat these commands):\n"
+                f"{json.dumps(turn_history, indent=2)}\n\n"
+                if turn_history
                 else ""
             )
-            + "Emit the shell commands to run now.",
+            + (
+                f"Already executed (normalized): {already}\n"
+                if already
+                else ""
+            )
+            + "Emit a *new* shell command to run now.",
         )
         responder_response = _stream_model(
             RESPONDER_MODEL,
@@ -814,41 +817,69 @@ def run_tool_workflow(request: dict) -> str:
         commands = _parse_commands(responder_response)
         if not commands:
             commands = _parse_commands(evaluator_response)
+
+        turn_results: list[dict] = []
+        resp: str | None = None
+
         if not commands:
-            execution_history.append(
+            turn_results.append(
                 {
-                    "step": step_count,
                     "command": "",
                     "error": "26B produced no parseable commands",
                     "stdout": "",
                     "stderr": responder_response[:2000],
                     "returncode": -1,
+                    "skipped": False,
                 }
             )
-            continue
-
-        resp: str | None = None
-        for cmd_info in commands:
-            cmd = cmd_info["command"].strip()
-            if not cmd:
-                continue
-
-            if permission_mode == "ask":
-                print(f"\n  {ANSI_YELLOW}Command:{ANSI_RESET} {cmd}", file=sys.stderr)
-                try:
-                    resp = input("  Execute? [Y/n/q] ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    resp = "q"
-                if resp in ("q", "quit"):
-                    print_evaluator(f"{ANSI_YELLOW}Execution cancelled by user.{ANSI_RESET}")
-                    break
-                if resp in ("n", "no"):
-                    print_evaluator(f"  {ANSI_DIM_GRAY}Skipped.{ANSI_RESET}")
+        else:
+            for cmd_info in commands:
+                cmd = cmd_info["command"].strip()
+                if not cmd:
+                    continue
+                key = _normalize_command(cmd)
+                if key in ran_commands:
+                    print_evaluator(
+                        f"  {ANSI_DIM_GRAY}Skipped duplicate: {cmd}{ANSI_RESET}"
+                    )
+                    turn_results.append(
+                        {
+                            "command": cmd,
+                            "skipped": True,
+                            "reason": "already executed this session",
+                            "stdout": "",
+                            "stderr": "",
+                            "returncode": None,
+                        }
+                    )
                     continue
 
-            print_evaluator(f"  -> Executing: {cmd}")
+                if permission_mode == "ask":
+                    print(f"\n  {ANSI_YELLOW}Command:{ANSI_RESET} {cmd}", file=sys.stderr)
+                    try:
+                        resp = input("  Execute? [Y/n/q] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        resp = "q"
+                    if resp in ("q", "quit"):
+                        print_evaluator(
+                            f"{ANSI_YELLOW}Execution cancelled by user.{ANSI_RESET}"
+                        )
+                        break
+                    if resp in ("n", "no"):
+                        print_evaluator(f"  {ANSI_DIM_GRAY}Skipped.{ANSI_RESET}")
+                        turn_results.append(
+                            {
+                                "command": cmd,
+                                "skipped": True,
+                                "reason": "user declined",
+                                "stdout": "",
+                                "stderr": "",
+                                "returncode": None,
+                            }
+                        )
+                        continue
 
-            for attempt in range(1 + max_retries_per_step):
+                print_evaluator(f"  -> Executing: {cmd}")
                 try:
                     result = subprocess.run(
                         cmd,
@@ -858,9 +889,8 @@ def run_tool_workflow(request: dict) -> str:
                         timeout=timeout_sec,
                     )
                     output = {
-                        "step": step_count,
-                        "attempt": attempt + 1,
                         "command": cmd,
+                        "skipped": False,
                         "returncode": result.returncode,
                         "stdout": result.stdout[:10000],
                         "stderr": result.stderr[:5000],
@@ -868,35 +898,42 @@ def run_tool_workflow(request: dict) -> str:
                     if result.returncode == 0:
                         print_evaluator(f"  OK (exit {result.returncode})")
                     else:
-                        print_evaluator(
-                            f"  FAIL (exit {result.returncode}) attempt {attempt + 1}"
-                        )
+                        print_evaluator(f"  FAIL (exit {result.returncode})")
                         if result.stderr.strip():
                             print_evaluator(f"  stderr: {result.stderr.strip()[:200]}")
                 except subprocess.TimeoutExpired:
                     output = {
-                        "step": step_count,
-                        "attempt": attempt + 1,
                         "command": cmd,
+                        "skipped": False,
                         "error": f"TIMEOUT (>={timeout_sec}s)",
                         "stdout": "",
                         "stderr": "",
+                        "returncode": -1,
                     }
                     print_evaluator(f"  TIMOUT (>{timeout_sec}s)")
                 except Exception as exc:
                     output = {
-                        "step": step_count,
-                        "attempt": attempt + 1,
                         "command": cmd,
+                        "skipped": False,
                         "error": str(exc),
                         "stdout": "",
                         "stderr": "",
+                        "returncode": -1,
                     }
                     print_evaluator(f"  Error: {exc}")
 
-                execution_history.append(output)
-                if output.get("returncode", -1) == 0 or attempt >= max_retries_per_step:
-                    break
+                ran_commands.add(key)
+                turn_results.append(output)
+
+        turn_history.append(
+            {
+                "step": step_count,
+                "gate": gate_decision,
+                "evaluator_analysis": evaluator_response[:4000],
+                "responder_output": responder_response[:2000],
+                "results": turn_results,
+            }
+        )
 
         if resp == "q":
             break
@@ -904,20 +941,23 @@ def run_tool_workflow(request: dict) -> str:
     os.chdir(original_cwd)
 
     outputs: list[str] = []
-    for entry in execution_history:
-        if entry.get("returncode") == 0:
-            out = entry.get("stdout", "").strip()
-            if out:
-                outputs.append(out)
-        elif "error" in entry:
-            outputs.append(f"[Error] {entry['error']}")
+    for turn in turn_history:
+        for entry in turn.get("results") or []:
+            if entry.get("skipped"):
+                continue
+            if entry.get("returncode") == 0:
+                out = (entry.get("stdout") or "").strip()
+                if out:
+                    outputs.append(out)
+            elif "error" in entry:
+                outputs.append(f"[Error] {entry['error']}")
 
     if outputs:
         return "\n".join(outputs)
 
     return (
-        f"[Tool mode completed — {len(execution_history)} step(s) executed, "
-        f"{len(execution_history)} result(s) collected]"
+        f"[Tool mode completed — {len(turn_history)} turn(s), "
+        f"{len(ran_commands)} unique command(s)]"
     )
 
 
