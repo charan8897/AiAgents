@@ -449,7 +449,7 @@ def evaluate_intent(
 
     style_enabled = start_evaluator_style()
     try:
-        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}) ---\n")
+        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}, {label}) ---\n")
         evaluator_response = stream_generate_content(
             EVALUATOR_MODEL,
             evaluator_session,
@@ -559,6 +559,23 @@ def run_repl(session: Session, history_path: Path | None = None) -> int:
         print(f"\nAssistant: {answer}\n")
     return 0
 
+def run_repl(session: Session, history_path: Path | None = None) -> int:
+    """Interactive multi-turn session with in-memory (and optional on-disk) history."""
+    print(
+        "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            break
 
 # ============================================================================
 # Tool mode — evaluator <-> executor feedback loop
