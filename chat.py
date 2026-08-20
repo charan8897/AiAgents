@@ -62,6 +62,10 @@ from typing import Callable
 RESPONDER_MODEL = "gemma-4-26b-a4b-it"
 EVALUATOR_MODEL = "gemma-4-31b-it"
 
+# Bumped on every behavior change; shown in the banners so it is always clear
+# which version of chat.py is actually running (e.g. after a git pull).
+SCRIPT_VERSION = "0.4.0 (2026-08-21)"
+
 # Socket timeout in seconds for each API request/read. Streaming keeps the
 # connection alive between tokens, so this only caps idle/stalled requests.
 # Override with the CHAT_TIMEOUT environment variable (in seconds).
@@ -622,6 +626,7 @@ def run_repl(session: Session, history_path: Path | None = None) -> int:
     '?' to force plain chat. History context flows into both modes.
     """
     print(
+        f"chat.py {SCRIPT_VERSION}\n"
         "Interactive mode. Type your message, or 'exit'/'quit' to leave.\n"
         "Queries are routed automatically (chat vs. tool execution).\n"
         "Prefix with '!' to force tool mode, '?' to force chat mode.",
@@ -979,6 +984,7 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
     timeout_strategy = limits.get("timeout_seconds", "flexible")
 
     _tool_style_header(f"TOOL MODE: {objective}")
+    print(f"   Version:     chat.py {SCRIPT_VERSION}", file=sys.stderr)
     print(f"   Directory:   {cwd}", file=sys.stderr)
     print(f"   Permission:  {permission_mode}", file=sys.stderr)
     print(f"   Max steps:   {max_steps}", file=sys.stderr)
@@ -1046,6 +1052,10 @@ def run_tool_workflow(request: dict, history: list[ChatTurn] | None = None) -> s
         f"Host OS: {os_name}. Use grep/find on Unix; findstr or powershell on Windows.\n"
         "Do not invent Unix tools on Windows.\n\n"
         "OUTPUT RULES:\n"
+        "- EVERY fenced code block in your reply WILL BE EXECUTED. Never put "
+        "draft, exploratory, or 'maybe' commands in code fences — reason in "
+        "plain text only, then emit the final command(s) in fenced block(s) "
+        "at the END of your reply.\n"
         "- Wrap each command in a fenced block: ```bash or ```powershell or ```cmd\n"
         "- A ```powershell block is executed as ONE PowerShell script, so "
         "multi-line PowerShell is fine there — but NEVER put PowerShell "
