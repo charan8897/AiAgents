@@ -8,10 +8,11 @@ Workflow:
 
 Tool mode (--tool):
     user query -> tools/cli.py -> normalized request JSON
-    -> evaluator <-> executor feedback loop:
-      - Evaluator (31B): plans & quality-gates
-      - Executor (subprocess): runs commands
-      - Feedback loop until quality pass or limits reached
+    -> evaluator (31B) <-> responder (26B) <-> executor loop:
+      - Evaluator (31B): plans, instructs 26B, quality-gates feedback
+      - Responder (26B): turns 31B instructions into shell commands
+      - Executor (subprocess): runs those commands
+      - stdout/stderr (error or success) is sent back to 31B as feedback
 
 History context:
     Conversation turns are kept as structured session data and sent to the API
@@ -590,23 +591,24 @@ def _tool_style_header(text: str) -> None:
 
 
 def _parse_commands(text: str) -> list[dict[str, str]]:
-    """Extract commands from evaluator output.
+    """Extract shell commands from 26B (or 31B) output.
 
-    Looks for bash code blocks (```bash ... ```) or COMMAND: prefixes.
+    Looks for fenced code blocks (bash/sh/powershell/cmd/shell) or COMMAND: lines.
     """
     import re
 
     commands: list[dict[str, str]] = []
-
-    # Try ```bash code blocks first
-    blocks = re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+    blocks = re.findall(
+        r"```(?:bash|sh|shell|powershell|pwsh|cmd|bat)?\n(.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
     for block in blocks:
         for line in block.split("\n"):
             line = line.strip()
             if line and not line.startswith("#"):
                 commands.append({"command": line, "source": "codeblock"})
 
-    # Also try COMMAND: prefix lines
     cmd_lines = re.findall(r"^COMMAND:\s*(.+)$", text, re.MULTILINE)
     for c in cmd_lines:
         cmd = c.strip()
@@ -643,20 +645,29 @@ def _parse_final(text: str) -> str | None:
     return None
 
 
+def _stream_model(model: str, session: Session, heading: str) -> str:
+    """Stream a model response to stderr under a labeled heading."""
+    style_enabled = start_evaluator_style()
+    try:
+        print_evaluator(f"\n--- {heading} ---\n")
+        text = stream_generate_content(model, session, on_text=stream_to_stderr)
+        print_evaluator("")
+        return text
+    finally:
+        stop_evaluator_style(style_enabled)
+
+
 def run_tool_workflow(request: dict) -> str:
-    """Execute the evaluator <-> executor feedback loop for tool execution.
+    """Evaluator (31B) instructs responder (26B); execution feeds back to 31B.
 
     Flow:
-      1. EVALUATOR (31B): analyses objective -> produces plan & commands
-      2. EXECUTOR (subprocess): runs the commands
-      3. EVALUATOR GATE: checks results for errors / content quality
-      4. If error/insufficient -> evaluator provides fixes -> executor retries
-      5. If good -> evaluator decides display -> final output
+      1. EVALUATOR (31B): analyse objective, write instructions for 26B
+      2. RESPONDER (26B): emit shell commands from those instructions
+      3. EXECUTOR: run 26B's commands
+      4. Feedback: stdout/stderr (error or sufficient/insufficient) -> 31B
+      5. 31B GATEs APPROVED / RETRY / REPLAN, then instructs 26B again
 
-    Loop terminates when:
-      - Evaluator approves the result (GATE: APPROVED + FINAL)
-      - max_steps reached (safety limit)
-      - max_replans reached (re-plan exhaustion)
+    Loop ends on GATE: APPROVED, max_steps, or max_replans.
     """
     objective = request["objective"]
     cwd = request.get("cwd", os.getcwd())
@@ -667,132 +678,110 @@ def run_tool_workflow(request: dict) -> str:
     permission_mode = request.get("permission_mode", "ask")
     timeout_strategy = limits.get("timeout_seconds", "flexible")
 
-    # --- Display header ---
     _tool_style_header(f"TOOL MODE: {objective}")
     print(f"   Directory:   {cwd}", file=sys.stderr)
     print(f"   Permission:  {permission_mode}", file=sys.stderr)
     print(f"   Max steps:   {max_steps}", file=sys.stderr)
     print(f"   Max replans: {max_replans}", file=sys.stderr)
+    print(f"   Evaluator:   {EVALUATOR_MODEL}", file=sys.stderr)
+    print(f"   Responder:   {RESPONDER_MODEL}", file=sys.stderr)
     print(file=sys.stderr)
 
-    # Change to working directory
     original_cwd = os.getcwd()
     os.chdir(cwd)
 
-    # State trackers
     execution_history: list[dict] = []
     step_count = 0
     replan_count = 0
-    gate_decision: str | None = None
 
-    # Helper to compute dynamic timeout
     def _get_timeout(step: int) -> int:
         if isinstance(timeout_strategy, int):
             return timeout_strategy
-        # Flexible: scale with step complexity, capped at 300s
         base = 30 if step <= 3 else 60
         return min(base + (step * 10), 300)
 
-    # Build the system instruction for the evaluator tool agent
-    system_instruction = (
-        "You are the evaluator agent in a tool-execution feedback loop.\n\n"
+    os_name = "Windows (cmd/PowerShell)" if os.name == "nt" else "Unix"
+    evaluator_system = (
+        "You are the 31B evaluator in a two-model tool loop.\n"
+        f"The 26B responder ({RESPONDER_MODEL}) writes shell commands. "
+        "You never execute commands yourself.\n\n"
         f"Normalized request:\n{json.dumps(request, indent=2)}\n\n"
+        f"Host OS: {os_name}. Instruct 26B to use commands that work on this OS.\n\n"
         "YOUR ROLE:\n"
-        "1. Analyse the user's objective and break it into concrete steps.\n"
-        "2. For each step, output the exact shell command to run.\n"
-        "3. After execution results come back, review them thoroughly:\n"
-        "   - CHECK_FOR_ERRORS: Are there error messages in stdout/stderr?\n"
-        "   - CHECK_CONTENT: Is the output sufficient to meet the objective?\n"
-        "   - CHECK_COMPLETENESS: Does the result fully satisfy the objective?\n"
-        "4. Decide the next action based on your review.\n\n"
-        "OUTPUT FORMAT RULES:\n"
-        "- Wrap each command to execute inside ```bash\\n<command>\\n```\n"
-        "- When reviewing results, start with: GATE: <decision>\n"
-        "  Decision must be one of: APPROVED, RETRY, or REPLAN.\n"
-        "  - APPROVED: The result is satisfactory. Output FINAL: <final answer>\n"
-        "  - RETRY: The result has errors or insufficient content. Explain the fix\n"
-        "    and output new commands in ```bash``` blocks.\n"
-        "  - REPLAN: A full re-think is needed (plan was wrong). Output new plan.\n"
-        "- Final answer must use: FINAL: <answer>\n"
-        "- Be concise but specific in commands.\n"
-        "- Never output commands that could cause harm.\n\n"
+        "1. Analyse the objective and write clear instructions for the 26B responder.\n"
+        "2. After execution feedback, review stdout/stderr:\n"
+        "   - CHECK_FOR_ERRORS: error messages or non-zero exit?\n"
+        "   - CHECK_CONTENT: is the output enough for the objective?\n"
+        "   - CHECK_COMPLETENESS: is the objective fully met?\n"
+        "3. GATE the result, then instruct 26B again unless APPROVED.\n\n"
+        "OUTPUT FORMAT:\n"
+        "- First line when reviewing: GATE: APPROVED | RETRY | REPLAN\n"
+        "  APPROVED: objective met. Then FINAL: <answer for the user>\n"
+        "  RETRY: errors or insufficient output. Explain the fix for 26B.\n"
+        "  REPLAN: the plan was wrong. Write a new plan for 26B.\n"
+        "- Then write INSTRUCTIONS: a paragraph telling 26B exactly what "
+        "commands to produce (OS-appropriate). Do not emit shell commands "
+        "yourself unless 26B is unavailable.\n"
+        "- Never instruct harmful commands.\n\n"
         f"Limits: max_steps={max_steps}, max_retries_per_step={max_retries_per_step}, "
         f"max_replans={max_replans}"
     )
+    responder_system = (
+        "You are the 26B responder in a tool-execution loop.\n"
+        "The 31B evaluator gives you instructions. You output shell commands only.\n\n"
+        f"Host OS: {os_name}. Use grep/find on Unix; findstr or powershell on Windows.\n"
+        "Do not invent Unix tools on Windows.\n\n"
+        "OUTPUT RULES:\n"
+        "- Wrap each command in a fenced block: ```bash or ```powershell or ```cmd\n"
+        "- One command per line. No commentary except brief # comments.\n"
+        "- Never output GATE or FINAL. Never run anything; only write commands.\n"
+        "- Prefer excluding .git, node_modules, venv, __pycache__.\n"
+    )
 
-    # ======================================================================
-    # Main loop
-    # ======================================================================
     while step_count < max_steps:
         step_count += 1
         timeout_sec = _get_timeout(step_count)
 
-        # --- Prepare evaluator session ---
-        evaluator_session = Session(system_instruction=system_instruction)
-
-        # Build the user message for this iteration
+        evaluator_session = Session(system_instruction=evaluator_system)
         if not execution_history:
-            # First iteration: send objective
             user_msg = (
                 f"Objective: {objective}\n\n"
-                "Analyse this objective and output the commands to execute. "
-                "Remember to wrap each command in ```bash``` blocks."
+                "Write INSTRUCTIONS for the 26B responder so it can emit "
+                "OS-appropriate shell commands. Do not GATE yet."
             )
         else:
-            # Subsequent iterations: send execution history for review
             user_msg = (
                 f"Objective: {objective}\n\n"
-                f"Execution history so far (step {step_count}):\n"
+                f"Execution feedback (step {step_count}):\n"
                 f"{json.dumps(execution_history, indent=2)}\n\n"
-                "Review the execution results above.\n"
-                "- If there are errors or content is insufficient, output GATE: RETRY with fixes.\n"
-                "- If the results satisfy the objective, output GATE: APPROVED and FINAL: <answer>.\n"
-                "- If the plan was fundamentally wrong, output GATE: REPLAN.\n"
+                "Review stdout/stderr above (error or sufficient/insufficient).\n"
+                "- GATE: APPROVED and FINAL: <answer> if the objective is met.\n"
+                "- GATE: RETRY plus INSTRUCTIONS for 26B if errors or weak output.\n"
+                "- GATE: REPLAN plus new INSTRUCTIONS if the plan was wrong.\n"
             )
-
         evaluator_session.add("user", user_msg)
+        evaluator_response = _stream_model(
+            EVALUATOR_MODEL,
+            evaluator_session,
+            f"Evaluator {EVALUATOR_MODEL} step {step_count}/{max_steps}",
+        )
 
-        # --- Call evaluator (stream to stderr) ---
-        style_enabled = start_evaluator_style()
-        try:
-            print_evaluator(f"\n--- Evaluator step {step_count}/{max_steps} ---\n")
-            evaluator_response = stream_generate_content(
-                EVALUATOR_MODEL,
-                evaluator_session,
-                on_text=stream_to_stderr,
-            )
-            print_evaluator("")  # newline
-        finally:
-            stop_evaluator_style(style_enabled)
-
-        # --- Parse evaluator output ---
-        commands = _parse_commands(evaluator_response)
         gate_decision = _parse_gate(evaluator_response)
-
-        # If gate says APPROVED with FINAL, extract and return
         if gate_decision == "APPROVED":
             final = _parse_final(evaluator_response)
+            os.chdir(original_cwd)
             if final:
-                os.chdir(original_cwd)
                 return final.strip()
-            # If no FINAL but APPROVED, treat last execution stdout as result
             if execution_history:
                 last = execution_history[-1]
                 last_out = last.get("stdout", last.get("stderr", "")).strip()
                 if last_out:
-                    os.chdir(original_cwd)
                     return last_out
-            # No content yet but approved — just return the evaluator's response
-            os.chdir(original_cwd)
             return evaluator_response.strip()
 
-        # If gate says RETRY or REPLAN
         if gate_decision == "RETRY":
-            # Commands from evaluator will be re-executed in next loop iteration
-            print_evaluator(f"\n{ANSI_YELLOW}Retrying with fixes...{ANSI_RESET}\n")
-            continue
-
-        if gate_decision == "REPLAN":
+            print_evaluator(f"\n{ANSI_YELLOW}31B: RETRY — instructing 26B...{ANSI_RESET}\n")
+        elif gate_decision == "REPLAN":
             replan_count += 1
             if replan_count > max_replans:
                 print_evaluator(
@@ -800,22 +789,50 @@ def run_tool_workflow(request: dict) -> str:
                 )
                 break
             print_evaluator(
-                f"\n{ANSI_YELLOW}Re-planning ({replan_count}/{max_replans})...{ANSI_RESET}\n"
+                f"\n{ANSI_YELLOW}31B: REPLAN ({replan_count}/{max_replans}) "
+                f"— instructing 26B...{ANSI_RESET}\n"
+            )
+
+        responder_session = Session(system_instruction=responder_system)
+        responder_session.add(
+            "user",
+            f"Objective: {objective}\n\n"
+            f"Instructions from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
+            + (
+                f"Last execution feedback:\n{json.dumps(execution_history[-3:], indent=2)}\n"
+                if execution_history
+                else ""
+            )
+            + "Emit the shell commands to run now.",
+        )
+        responder_response = _stream_model(
+            RESPONDER_MODEL,
+            responder_session,
+            f"Responder {RESPONDER_MODEL} step {step_count}/{max_steps}",
+        )
+
+        commands = _parse_commands(responder_response)
+        if not commands:
+            commands = _parse_commands(evaluator_response)
+        if not commands:
+            execution_history.append(
+                {
+                    "step": step_count,
+                    "command": "",
+                    "error": "26B produced no parseable commands",
+                    "stdout": "",
+                    "stderr": responder_response[:2000],
+                    "returncode": -1,
+                }
             )
             continue
 
-        # --- If no gate decision yet but we have commands, execute them ---
-        if not commands:
-            continue
-
-        # --- Execute commands ---
         resp: str | None = None
         for cmd_info in commands:
             cmd = cmd_info["command"].strip()
             if not cmd:
                 continue
 
-            # Permission check
             if permission_mode == "ask":
                 print(f"\n  {ANSI_YELLOW}Command:{ANSI_RESET} {cmd}", file=sys.stderr)
                 try:
@@ -831,7 +848,6 @@ def run_tool_workflow(request: dict) -> str:
 
             print_evaluator(f"  -> Executing: {cmd}")
 
-            # Execute with retry logic
             for attempt in range(1 + max_retries_per_step):
                 try:
                     result = subprocess.run(
@@ -846,18 +862,17 @@ def run_tool_workflow(request: dict) -> str:
                         "attempt": attempt + 1,
                         "command": cmd,
                         "returncode": result.returncode,
-                        "stdout": result.stdout[:10000],   # trim for model context
+                        "stdout": result.stdout[:10000],
                         "stderr": result.stderr[:5000],
                     }
-
-                    # Print result summary
                     if result.returncode == 0:
                         print_evaluator(f"  OK (exit {result.returncode})")
                     else:
-                        print_evaluator(f"  FAIL (exit {result.returncode}) attempt {attempt+1}")
+                        print_evaluator(
+                            f"  FAIL (exit {result.returncode}) attempt {attempt + 1}"
+                        )
                         if result.stderr.strip():
                             print_evaluator(f"  stderr: {result.stderr.strip()[:200]}")
-
                 except subprocess.TimeoutExpired:
                     output = {
                         "step": step_count,
@@ -868,7 +883,6 @@ def run_tool_workflow(request: dict) -> str:
                         "stderr": "",
                     }
                     print_evaluator(f"  TIMOUT (>{timeout_sec}s)")
-
                 except Exception as exc:
                     output = {
                         "step": step_count,
@@ -881,21 +895,14 @@ def run_tool_workflow(request: dict) -> str:
                     print_evaluator(f"  Error: {exc}")
 
                 execution_history.append(output)
-
-                # If success or last attempt, move to next command
                 if output.get("returncode", -1) == 0 or attempt >= max_retries_per_step:
                     break
 
-        # If user cancelled, exit loop
         if resp == "q":
             break
 
-    # ======================================================================
-    # Loop exhausted — build best-effort result
-    # ======================================================================
     os.chdir(original_cwd)
 
-    # Collect all stdout from successful commands
     outputs: list[str] = []
     for entry in execution_history:
         if entry.get("returncode") == 0:
@@ -908,7 +915,6 @@ def run_tool_workflow(request: dict) -> str:
     if outputs:
         return "\n".join(outputs)
 
-    # Fallback: return summary
     return (
         f"[Tool mode completed — {len(execution_history)} step(s) executed, "
         f"{len(execution_history)} result(s) collected]"
