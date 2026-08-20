@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -47,6 +48,54 @@ class IntentPromptTemplate:
 
     raw_yaml: str
     prompt: str
+
+
+@dataclass(frozen=True)
+class ChatTurn:
+    """One stored conversation turn: role is 'user' or 'assistant'."""
+
+    role: str
+    content: str
+
+
+def format_history(history: list[ChatTurn]) -> str:
+    """Render prior turns as labeled lines for prompt context."""
+    lines = []
+    for turn in history:
+        label = "User" if turn.role == "user" else "Assistant"
+        lines.append(f"{label}: {turn.content}")
+    return "\n".join(lines)
+
+
+def load_history(path: Path) -> list[ChatTurn]:
+    """Load conversation history from a JSON file (missing/corrupt -> empty)."""
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    turns: list[ChatTurn] = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+                continue
+            role = item.get("role")
+            turns.append(
+                ChatTurn(
+                    role=role if role in {"user", "assistant"} else "user",
+                    content=item["content"],
+                )
+            )
+    return turns
+
+
+def save_history(path: Path, history: list[ChatTurn]) -> None:
+    """Persist conversation history as a JSON file."""
+    data = [{"role": turn.role, "content": turn.content} for turn in history]
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def enable_windows_ansi() -> bool:
@@ -295,8 +344,19 @@ def stream_to_stderr(text: str) -> None:
     print_evaluator(text)
 
 
-def evaluate_intent(user_query: str, intent_template: IntentPromptTemplate) -> str:
+def evaluate_intent(
+    user_query: str,
+    intent_template: IntentPromptTemplate,
+    history: list[ChatTurn] | None = None,
+) -> str:
     """Stream 31B evaluator intent analysis using the YAML prompt."""
+    history_text = format_history(history or [])
+    history_section = (
+        f"\nConversation history (prior turns):\n{history_text}\n"
+        if history_text
+        else ""
+    )
+
     evaluator_input = f"""You are the evaluator agent in a two-agent workflow.
 
 Read this exact YAML prompt template loaded from intent_prompt.yaml:
@@ -306,11 +366,11 @@ Read this exact YAML prompt template loaded from intent_prompt.yaml:
 
 Parsed prompt instruction from YAML key `prompt`:
 {intent_template.prompt}
-
+{history_section}
 User query:
 {user_query}
 
-Analyze the user's query intent according to the YAML prompt template. The YAML file content was provided above; do not say it is missing or implied. Return your full analysis for the responder agent."""
+Analyze the user's query intent according to the YAML prompt template. The YAML file content was provided above; do not say it is missing or implied. Use the conversation history for context when the query refers to earlier turns. Return your full analysis for the responder agent."""
 
     style_enabled = start_evaluator_style()
     try:
@@ -342,8 +402,20 @@ def clean_final_answer(text: str) -> str:
         answer = answer[1:-1].strip()
     return answer
 
-def respond(user_query: str, intent_template: IntentPromptTemplate, evaluator_response: str) -> str:
+def respond(
+    user_query: str,
+    intent_template: IntentPromptTemplate,
+    evaluator_response: str,
+    history: list[ChatTurn] | None = None,
+) -> str:
     """Ask the 26B responder to produce the final end-user response."""
+    history_text = format_history(history or [])
+    history_section = (
+        f"\nConversation history (prior turns):\n{history_text}\n"
+        if history_text
+        else ""
+    )
+
     responder_input = f"""You are the final responder agent. Produce exactly one final answer for the end user.
 
 Strict output rules:
@@ -352,10 +424,11 @@ Strict output rules:
 - Do not mention roles, evaluator, intent recognition, routing, YAML, prompt templates, or this task.
 - Do not quote the final answer.
 - Do not provide alternatives, analysis, bullet points, labels, or explanations.
+- You may reference earlier turns from the conversation history when relevant.
 
 Original user query:
 {user_query}
-
+{history_section}
 Intent recognition YAML prompt template loaded from intent_prompt.yaml:
 ```yaml
 {intent_template.raw_yaml}
@@ -371,20 +444,87 @@ Now write only the final answer for the end user."""
     return clean_final_answer(generate_content(RESPONDER_MODEL, responder_input))
 
 
-def ask(message: str) -> str:
+def ask(message: str, history: list[ChatTurn] | None = None) -> str:
     """Run the complete multi-agent workflow and return the final response."""
     intent_template = load_intent_prompt_template()
-    evaluator_response = evaluate_intent(message, intent_template)
-    return respond(message, intent_template, evaluator_response)
+    evaluator_response = evaluate_intent(message, intent_template, history)
+    return respond(message, intent_template, evaluator_response, history)
+
+
+def run_repl(history: list[ChatTurn], history_path: Path | None = None) -> int:
+    """Interactive multi-turn session with in-memory (and optional on-disk) history."""
+    print(
+        "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            break
+
+        try:
+            answer = ask(user_input, history)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            continue
+
+        history.append(ChatTurn(role="user", content=user_input))
+        history.append(ChatTurn(role="assistant", content=answer))
+        if history_path is not None:
+            save_history(history_path, history)
+
+        print(f"\nAssistant: {answer}\n")
+    return 0
 
 
 def main() -> int:
-    message = " ".join(sys.argv[1:]).strip() or "hi"
+    parser = argparse.ArgumentParser(
+        description="Multi-agent Gemma chat client with conversation history."
+    )
+    parser.add_argument(
+        "message",
+        nargs="*",
+        help="one-shot message; omit to start an interactive session",
+    )
+    parser.add_argument(
+        "--history",
+        type=Path,
+        help="JSON file to load/save conversation history",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="ignore any existing history file",
+    )
+    args = parser.parse_args()
+
+    history: list[ChatTurn] = []
+    if args.history is not None and not args.reset:
+        history = load_history(args.history)
+
+    message = " ".join(args.message).strip()
+    if not message:
+        return run_repl(history, args.history)
+
     try:
-        print(ask(message))
+        answer = ask(message, history)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+    history.append(ChatTurn(role="user", content=message))
+    history.append(ChatTurn(role="assistant", content=answer))
+    if args.history is not None:
+        save_history(args.history, history)
+
+    print(answer)
     return 0
 
 
