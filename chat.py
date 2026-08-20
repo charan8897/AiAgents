@@ -7,9 +7,11 @@ Workflow:
     -> responder (gemma-4-26b-a4b-it) streams the final answer
 
 History context:
-    Prior turns (user + assistant) are injected into both agents so follow-up
-    queries are answered in context. An interactive session keeps history in
-    memory; --history FILE persists it as JSON across runs.
+    Conversation turns are kept as structured session data and sent to the API
+    as native multi-turn contents (role 'user'/'model'), with the static agent
+    instructions carried in systemInstruction — history is never flattened
+    into prompt text. An interactive session keeps the session in memory;
+    --history FILE persists turns as JSON across runs.
 
 This uses a Gemini Console / Google AI Studio API key.
 
@@ -30,7 +32,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -74,13 +76,32 @@ class ChatTurn:
     content: str
 
 
-def format_history(history: list[ChatTurn]) -> str:
-    """Render prior turns as labeled lines for prompt context."""
-    lines = []
-    for turn in history:
-        label = "User" if turn.role == "user" else "Assistant"
-        lines.append(f"{label}: {turn.content}")
-    return "\n".join(lines)
+@dataclass
+class Session:
+    """In-memory multi-turn conversation.
+
+    Turns are kept as structured (role, content) pairs and rendered as native
+    Gemini contents (roles 'user'/'model') when sent, so the API sees real
+    turns instead of flattened text. ``system_instruction`` carries the static
+    agent instructions (role, rules, prompt template).
+    """
+
+    turns: list[ChatTurn] = field(default_factory=list)
+    system_instruction: str = ""
+
+    def add(self, role: str, content: str) -> None:
+        """Append a turn (role: 'user' or 'assistant')."""
+        self.turns.append(ChatTurn(role=role, content=content))
+
+    def contents(self) -> list[dict[str, object]]:
+        """Render turns as native Gemini contents (assistant -> model)."""
+        return [
+            {
+                "role": "model" if turn.role == "assistant" else "user",
+                "parts": [{"text": turn.content}],
+            }
+            for turn in self.turns
+        ]
 
 
 def load_history(path: Path) -> list[ChatTurn]:
@@ -246,16 +267,16 @@ def build_api_url(model: str, *, stream: bool = False) -> str:
     return api_url
 
 
-def build_payload(prompt: str) -> dict[str, object]:
-    """Build a Gemini generateContent request payload."""
-    return {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ]
-    }
+def build_payload(session: Session) -> dict[str, object]:
+    """Build a Gemini generateContent request payload from a session.
+
+    Conversation turns are sent as native multi-turn contents instead of
+    flattened text, and static instructions go into systemInstruction.
+    """
+    payload: dict[str, object] = {"contents": session.contents()}
+    if session.system_instruction:
+        payload["system_instruction"] = {"parts": [{"text": session.system_instruction}]}
+    return payload
 
 
 def extract_text(data: dict[str, object]) -> str:
@@ -277,53 +298,39 @@ def extract_text(data: dict[str, object]) -> str:
         return ""
 
 
-def generate_content(model: str, prompt: str) -> str:
-    """Call the Gemini generateContent endpoint for a single model/prompt."""
-    request = urllib.request.Request(
-        build_api_url(model),
-        data=json.dumps(build_payload(prompt)).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"{model} API request failed with HTTP {exc.code}: {body}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {model} API: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError(
-            f"{model} API request timed out after {REQUEST_TIMEOUT}s (no response received)"
-        ) from exc
-
-    text = extract_text(data).strip()
-    if not text:
-        raise RuntimeError(f"{model} returned an empty response: {json.dumps(data, indent=2)}")
-    return text
-
-
-def stream_generate_content(
+def _call_gemini(
     model: str,
-    prompt: str,
+    payload: dict[str, object],
+    *,
+    stream: bool,
     on_text: Callable[[str], None] | None = None,
+    _retried: bool = False,
 ) -> str:
-    """Stream Gemini output in real time and return the complete response text."""
+    """POST a payload to Gemini and return the generated text.
+
+    Handles HTTP/network/timeout errors as RuntimeError. If the model rejects
+    systemInstruction (HTTP 400), retries once without it.
+    """
+    url = build_api_url(model, stream=stream)
     request = urllib.request.Request(
-        build_api_url(model, stream=True),
-        data=json.dumps(build_payload(prompt)).encode("utf-8"),
+        url,
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
 
-    chunks: list[str] = []
-
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            if not stream:
+                data = json.loads(response.read().decode("utf-8"))
+                text = extract_text(data).strip()
+                if not text:
+                    raise RuntimeError(
+                        f"{model} returned an empty response: {json.dumps(data, indent=2)}"
+                    )
+                return text
+
+            chunks: list[str] = []
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or not line.startswith("data:"):
@@ -345,24 +352,53 @@ def stream_generate_content(
                 chunks.append(text)
                 if on_text:
                     on_text(text)
+
+            text = "".join(chunks).strip()
+            if not text:
+                raise RuntimeError(f"{model} returned an empty streaming response")
+            return text
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
+        if (
+            not _retried
+            and exc.code == 400
+            and "systemInstruction" in body
+            and payload.get("system_instruction") is not None
+        ):
+            stripped = {k: v for k, v in payload.items() if k != "system_instruction"}
+            return _call_gemini(
+                model, stripped, stream=stream, on_text=on_text, _retried=True
+            )
+        kind = "streaming " if stream else ""
         raise RuntimeError(
-            f"{model} streaming API request failed with HTTP {exc.code}: {body}"
+            f"{model} {kind}API request failed with HTTP {exc.code}: {body}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {model} streaming API: {exc.reason}") from exc
+        kind = "streaming " if stream else ""
+        raise RuntimeError(f"Could not reach {model} {kind}API: {exc.reason}") from exc
     except TimeoutError as exc:
+        kind = "streaming " if stream else ""
+        suffix = "" if stream else " (no response received)"
         raise RuntimeError(
-            f"{model} streaming API request timed out after {REQUEST_TIMEOUT}s"
+            f"{model} {kind}API request timed out after {REQUEST_TIMEOUT}s{suffix}"
         ) from exc
     except OSError as exc:
-        raise RuntimeError(f"{model} streaming API connection error: {exc}") from exc
+        kind = "streaming " if stream else ""
+        raise RuntimeError(f"{model} {kind}API connection error: {exc}") from exc
 
-    text = "".join(chunks).strip()
-    if not text:
-        raise RuntimeError(f"{model} returned an empty streaming response")
-    return text
+
+def generate_content(model: str, session: Session) -> str:
+    """Call the Gemini generateContent endpoint for a single model/session."""
+    return _call_gemini(model, build_payload(session), stream=False)
+
+
+def stream_generate_content(
+    model: str,
+    session: Session,
+    on_text: Callable[[str], None] | None = None,
+) -> str:
+    """Stream Gemini output in real time and return the complete response text."""
+    return _call_gemini(model, build_payload(session), stream=True, on_text=on_text)
 
 
 def stream_to_stderr(text: str) -> None:
@@ -373,30 +409,43 @@ def stream_to_stderr(text: str) -> None:
 def evaluate_intent(
     user_query: str,
     intent_template: IntentPromptTemplate,
-    history: list[ChatTurn] | None = None,
+    session: Session | None = None,
 ) -> str:
-    """Stream 31B evaluator intent analysis using the YAML prompt."""
-    history_text = format_history(history or [])
-    history_section = (
-        f"\nConversation history (prior turns):\n{history_text}\n"
-        if history_text
-        else ""
+    """Stream 31B evaluator intent analysis using the YAML prompt.
+
+    The evaluator's static instructions go in systemInstruction; the
+    conversation history (if any) is sent as native prior turns, with the
+    current query as the final user turn. P3 will narrow this to a digest.
+    """
+    evaluator_session = Session(
+        system_instruction=(
+            "You are the evaluator agent in a two-agent workflow.\n\n"
+            "Read this exact YAML prompt template loaded from intent_prompt.yaml:\n"
+            f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
+            f"Parsed prompt instruction from YAML key `prompt`:\n{intent_template.prompt}\n\n"
+            "Analyze the user's query intent according to the YAML prompt template. "
+            "The YAML file content was provided above; do not say it is missing or implied. "
+            "Use the conversation history for context when the query refers to earlier turns. "
+            "Return your full analysis for the responder agent."
+        )
     )
+    if session is not None:
+        evaluator_session.turns = list(session.turns)
+    evaluator_session.add("user", user_query)
 
-    evaluator_input = f"""You are the evaluator agent in a two-agent workflow.
+    style_enabled = start_evaluator_style()
+    try:
+        print_evaluator(f"\n--- Streaming evaluator ({EVALUATOR_MODEL}) ---\n")
+        evaluator_response = stream_generate_content(
+            EVALUATOR_MODEL,
+            evaluator_session,
+            on_text=stream_to_stderr,
+        )
+        print_evaluator("\n--- Evaluator complete; generating final answer ---\n\n")
+    finally:
+        stop_evaluator_style(style_enabled)
 
-Read this exact YAML prompt template loaded from intent_prompt.yaml:
-```yaml
-{intent_template.raw_yaml}
-```
-
-Parsed prompt instruction from YAML key `prompt`:
-{intent_template.prompt}
-{history_section}
-User query:
-{user_query}
-
-Analyze the user's query intent according to the YAML prompt template. The YAML file content was provided above; do not say it is missing or implied. Use the conversation history for context when the query refers to earlier turns. Return your full analysis for the responder agent."""
+    return evaluator_response
 
     style_enabled = start_evaluator_style()
     try:
@@ -432,7 +481,7 @@ def respond(
     user_query: str,
     intent_template: IntentPromptTemplate,
     evaluator_response: str,
-    history: list[ChatTurn] | None = None,
+    session: Session | None = None,
 ) -> str:
     """Ask the 26B responder to produce the final end-user response.
 
@@ -440,50 +489,45 @@ def respond(
     output is produced incrementally instead of one blocking read, which is
     more resilient against long generations; the final answer is still printed
     only once, complete, after streaming finishes.
+
+    Static instructions go in systemInstruction; history is native prior
+    turns; the query and the evaluator's analysis are separate user turns.
     """
-    history_text = format_history(history or [])
-    history_section = (
-        f"\nConversation history (prior turns):\n{history_text}\n"
-        if history_text
-        else ""
+    responder_session = Session(
+        system_instruction=(
+            "You are the final responder agent. Produce exactly one final answer "
+            "for the end user.\n\n"
+            "Strict output rules:\n"
+            "- Your entire response must be exactly one line in this format: FINAL_ANSWER: <answer>\n"
+            "- Do not write anything before FINAL_ANSWER.\n"
+            "- Do not mention roles, evaluator, intent recognition, routing, YAML, prompt templates, or this task.\n"
+            "- Do not quote the final answer.\n"
+            "- Do not provide alternatives, analysis, bullet points, labels, or explanations.\n"
+            "- You may reference earlier turns from the conversation history when relevant.\n\n"
+            "Intent recognition YAML prompt template loaded from intent_prompt.yaml:\n"
+            f"```yaml\n{intent_template.raw_yaml}\n```\n\n"
+            f"Parsed YAML prompt instruction:\n{intent_template.prompt}"
+        )
     )
-
-    responder_input = f"""You are the final responder agent. Produce exactly one final answer for the end user.
-
-Strict output rules:
-- Your entire response must be exactly one line in this format: FINAL_ANSWER: <answer>
-- Do not write anything before FINAL_ANSWER.
-- Do not mention roles, evaluator, intent recognition, routing, YAML, prompt templates, or this task.
-- Do not quote the final answer.
-- Do not provide alternatives, analysis, bullet points, labels, or explanations.
-- You may reference earlier turns from the conversation history when relevant.
-
-Original user query:
-{user_query}
-{history_section}
-Intent recognition YAML prompt template loaded from intent_prompt.yaml:
-```yaml
-{intent_template.raw_yaml}
-```
-
-Parsed YAML prompt instruction:
-{intent_template.prompt}
-
-Full evaluator response from {EVALUATOR_MODEL}:
-{evaluator_response}
-
-Now write only the final answer for the end user."""
-    return clean_final_answer(stream_generate_content(RESPONDER_MODEL, responder_input))
+    if session is not None:
+        responder_session.turns = list(session.turns)
+    responder_session.add("user", user_query)
+    responder_session.add(
+        "user",
+        f"Full evaluator response from {EVALUATOR_MODEL}:\n{evaluator_response}\n\n"
+        "Now write only the final answer for the end user.",
+    )
+    return clean_final_answer(stream_generate_content(RESPONDER_MODEL, responder_session))
 
 
-def ask(message: str, history: list[ChatTurn] | None = None) -> str:
+def ask(message: str, session: Session | None = None) -> str:
     """Run the complete multi-agent workflow and return the final response."""
     intent_template = load_intent_prompt_template()
-    evaluator_response = evaluate_intent(message, intent_template, history)
-    return respond(message, intent_template, evaluator_response, history)
+    evaluator_response = evaluate_intent(message, intent_template, session)
+    return respond(message, intent_template, evaluator_response, session)
 
 
-def run_repl(history: list[ChatTurn], history_path: Path | None = None) -> int:
+def run_repl(session: Session, history_path: Path | None = None) -> int:
     """Interactive multi-turn session with in-memory (and optional on-disk) history."""
     print(
         "Interactive mode. Type your message, or 'exit'/'quit' to leave.",
@@ -502,15 +546,15 @@ def run_repl(history: list[ChatTurn], history_path: Path | None = None) -> int:
             break
 
         try:
-            answer = ask(user_input, history)
+            answer = ask(user_input, session)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             continue
 
-        history.append(ChatTurn(role="user", content=user_input))
-        history.append(ChatTurn(role="assistant", content=answer))
+        session.add("user", user_input)
+        session.add("assistant", answer)
         if history_path is not None:
-            save_history(history_path, history)
+            save_history(history_path, session.turns)
 
         print(f"\nAssistant: {answer}\n")
     return 0
@@ -537,24 +581,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    history: list[ChatTurn] = []
+    session = Session()
     if args.history is not None and not args.reset:
-        history = load_history(args.history)
+        session.turns = load_history(args.history)
 
     message = " ".join(args.message).strip()
     if not message:
-        return run_repl(history, args.history)
+        return run_repl(session, args.history)
 
     try:
-        answer = ask(message, history)
+        answer = ask(message, session)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    history.append(ChatTurn(role="user", content=message))
-    history.append(ChatTurn(role="assistant", content=answer))
+    session.add("user", message)
+    session.add("assistant", answer)
     if args.history is not None:
-        save_history(args.history, history)
+        save_history(args.history, session.turns)
 
     print(answer)
     return 0
